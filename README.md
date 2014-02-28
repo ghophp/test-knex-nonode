@@ -1,4 +1,11 @@
 test-knex-nonode
 ================
 
-A example of how to use the no-node-knex
+This is project was created to be used with https://github.com/ghophp/knex.
+
+##usage
+
+	npm install
+	grunt
+	cd mock-app/
+	python server.py
