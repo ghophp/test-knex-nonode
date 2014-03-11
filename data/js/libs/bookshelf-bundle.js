@@ -1,2174 +1,3308 @@
-require=(function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);throw new Error("Cannot find module '"+o+"'")}var f=n[o]={exports:{}};t[o][0].call(f.exports,function(e){var n=t[o][1][e];return s(n?n:e)},f,f.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
-// ClientBase
-// ----------
-var Helpers = require('../lib/helpers').Helpers;
-
-// The `ClientBase` is assumed as the object that all database `clients`
-// inherit from, and is used in an `instanceof` check when initializing the
-// library. If you wish to write or customize an adapter, just inherit from
-// this base, with `ClientBase.extend`, and you're good to go.
-var ClientBase = function() {};
-
-// The methods assumed when building a client.
-ClientBase.prototype = {
-
-  // Gets the raw connection for the current client.
-  getRawConnection: function() {},
-
-  // Execute a query on the specified `Builder` or `SchemaBuilder`
-  // interface. If a `connection` is specified, use it, otherwise
-  // acquire a connection, and then dispose of it when we're done.
-  query: function() {},
-
-  // Retrieves a connection from the connection pool,
-  // returning a promise.
-  getConnection: function() {},
-
-  // Releases a connection from the connection pool,
-  // returning a promise.
-  releaseConnection: function(conn) {},
-
-  // Begins a transaction statement on the instance,
-  // resolving with the connection of the current transaction.
-  startTransaction: function() {},
-
-  // Finishes a transaction, taking the `type`
-  finishTransaction: function(type, transaction, msg) {},
-
-  // The pool defaults.
-  poolDefaults: function() {}
-
-};
-
-// Grab the standard `Object.extend` as popularized by Backbone.js.
-ClientBase.extend = Helpers.extend;
-
-exports.ClientBase = ClientBase;
-
-},{"../lib/helpers":16}],2:[function(require,module,exports){
-// Grammar
-// -------
-
-// The "Grammar" is a collection of functions
-// which help to reliably compile the various pieces
-// of SQL into a valid, escaped query. These functions
-// are combined with dialect specific "Grammar" functions
-// to keep the interface database agnostic.
-var _       = require('lodash');
-
-var Raw     = require('../../lib/raw').Raw;
-var Helpers = require('../../lib/helpers').Helpers;
-
-var push    = [].push;
-
-// The list of different components
-var components = [
-  'columns', 'aggregates', 'from',
-  'joins', 'wheres', 'groups', 'havings',
-  'orders', 'limit', 'offset', 'unions'
-];
-
-exports.baseGrammar = {
-
-  // Compiles the current query builder.
-  toSql: function(builder) {
-    builder.type = builder.type || 'select';
-    return builder.grammar['compile' + Helpers.capitalize(builder.type)](builder);
-  },
-
-  // Gets the cleaned bindings.
-  getBindings: function(builder) {
-    var bindings = builder.bindings;
-    var cleaned = [];
-    for (var i = 0, l = bindings.length; i < l; i++) {
-      // if (bindings[i] == void 0) continue;
-      if (!bindings[i] || bindings[i]._source !== 'Raw') {
-        cleaned.push(bindings[i]);
-      } else {
-        push.apply(cleaned, bindings[i].bindings);
-      }
-    }
-    return cleaned;
-  },
-
-  // Compiles the `select` statement, or nested sub-selects
-  // by calling each of the component compilers, trimming out
-  // the empties, and returning a generated query string.
-  compileSelect: function(qb) {
-    var sql = [];
-    if (_.isEmpty(qb.columns) && _.isEmpty(qb.aggregates)) qb.columns = ['*'];
-    for (var i = 0, l = components.length; i < l; i++) {
-      var component = components[i];
-      var result = _.result(qb, component);
-      if (result != null) {
-        sql.push(this['compile' + Helpers.capitalize(component)](qb, result));
-      }
-    }
-    // If there is a transaction, and we have either `forUpdate` or `forShare` specified,
-    // call the appropriate additions to the select statement.
-    if (qb.transaction && qb.flags.selectMode) {
-      sql.push(this['compile' + qb.flags.selectMode](qb));
-    }
-    return _.compact(sql).join(' ');
-  },
-
-  // Compiles the columns with aggregate functions.
-  compileAggregates: function(qb) {
-    var sql = [], segments, column;
-    for (var i = 0, l = qb.aggregates.length; i < l; i++) {
-      var aggregate = qb.aggregates[i];
-      if (aggregate.columns.toLowerCase().indexOf(' as ') !== -1) {
-        segments = aggregate.columns.split(' ');
-        column = segments[0];
-      } else {
-        column = aggregate.columns;
-      }
-      sql.push(aggregate.type + '(' + this.wrap(column) + ')' + (segments ? ' as ' + this.wrap(segments[2]) : ''));
-    }
-    return sql.join(', ');
-  },
-
-  // Compiles the columns in the query, specifying if an item was distinct.
-  compileColumns: function(qb, columns) {
-    var columnsIsArray = _.isArray(columns);
-    var columnsEmpty = _.isEmpty(columns);
-    var sql = (qb.flags.distinct ? 'select distinct' : 'select') + ((columnsIsArray && columnsEmpty) ? '' : ' '+this.columnize(columns));
-    sql = qb.aggregates.length && !columnsEmpty ? sql + ',' : sql;
-    return sql;
-  },
-
-  // Compiles the `from` tableName portion of the query.
-  compileFrom: function(qb, table) {
-    return 'from ' + this.wrapTable(table);
-  },
-
-  // Compiles all each of the `join` clauses on the query,
-  // including any nested join queries.
-  compileJoins: function(qb, joins) {
-    var sql = [];
-    for (var i = 0, l = joins.length; i < l; i++) {
-      var join = joins[i];
-      var clauses = [];
-      for (var i2 = 0, l2 = join.clauses.length; i2 < l2; i2++) {
-        var clause = join.clauses[i2];
-        clauses.push(
-          [clause['bool'], this.wrap(clause['first']), clause.operator, this.wrap(clause['second'])].join(' ')
-        );
-      }
-      clauses[0] = clauses[0].replace(/and |or /, '');
-      sql.push(join.joinType + ' join ' + this.wrapTable(join.table) + ' on ' + clauses.join(' '));
-    }
-    return sql.join(' ');
-  },
-
-  // Compiles all `where` statements on the query.
-  compileWheres: function(qb) {
-    var sql = [];
-    var wheres = qb.wheres;
-    if (wheres.length === 0) return '';
-    for (var i = 0, l = wheres.length; i < l; i++) {
-      var where = wheres[i];
-      sql.push(where.bool + ' ' + this['where' + where.type](qb, where));
-    }
-    return (sql.length > 0 ? 'where ' + sql.join(' ').replace(/and |or /, '') : '');
-  },
-
-  // Compile the "union" queries attached to the main query.
-  compileUnions: function(qb) {
-    var sql = '';
-    for (var i = 0, l = qb.unions.length; i < l; i++) {
-      var union = qb.unions[i];
-      sql += (union.all ? 'union all ' : 'union ') + this.compileSelect(union.query);
-    }
-    return sql;
-  },
-
-  // Compiles a nested where clause.
-  whereNested: function(qb, where) {
-    return '(' + this.compileWheres(where.query).slice(6) + ')';
-  },
-
-  // Compiles a nested where clause.
-  whereSub: function(qb, where) {
-    return this.wrap(where.column) + ' ' + where.operator + ' (' + (this.compileSelect(where.query)) + ')';
-  },
-
-  // Compiles a basic where clause.
-  whereBasic: function(qb, where) {
-    return this.wrap(where.column) + ' ' + where.operator + ' ' + this.parameter(where.value);
-  },
-
-  // Compiles a basic exists clause.
-  whereExists: function(qb, where) {
-    return 'exists (' + this.compileSelect(where.query) + ')';
-  },
-
-  // Compiles a basic not exists clause.
-  whereNotExists: function(qb, where) {
-    return 'not exists (' + this.compileSelect(where.query) + ')';
-  },
-
-  // Compiles a where in clause.
-  whereIn: function(qb, where) {
-    return this.wrap(where.column) + ' in (' + this.parameterize(where.value) + ')';
-  },
-
-  // Compiles a where not in clause.
-  whereNotIn: function(qb, where) {
-    return this.wrap(where.column) + ' not in (' + this.parameterize(where.value) + ')';
-  },
-
-  // Compiles a sub-where in clause.
-  whereInSub: function(qb, where) {
-    return this.wrap(where.column) + ' in (' + this.compileSelect(where.query) + ')';
-  },
-
-  // Compiles a sub-where not in clause.
-  whereNotInSub: function(qb, where) {
-    return this.wrap(where.column) + ' not in (' + this.compileSelect(where.query) + ')';
-  },
-
-  // Where between.
-  whereBetween: function(qb, where) {
-    return this.wrap(where.column) + ' between ? and ?';
-  },
-
-  whereNull: function(qb, where) {
-    return this.wrap(where.column) + ' is null';
-  },
-
-  whereNotNull: function(qb, where) {
-    return this.wrap(where.column) + ' is not null';
-  },
-
-  whereRaw: function(qb, where) {
-    return where.sql;
-  },
-
-  // Compiles the `group by` columns.
-  compileGroups: function(qb, groups) {
-    return 'group by ' + this.columnize(groups);
-  },
-
-  // Compiles the `having` statements.
-  compileHavings: function(qb, havings) {
-    if (!havings.length) return;
-    var h = 'having ' + havings.map(function(having) {
-      if (having.type === 'Raw') {
-        return having.bool + ' ' + having.sql;
-      }
-      return having.bool + ' ' + this.wrap(having.column) + ' ' + having.operator + ' ' + this.parameter(having['value']);
-    }, this);
-    return h.replace(/and |or /, '');
-  },
-
-  // Compiles the `order by` statements.
-  compileOrders: function(qb, orders) {
-    if (orders.length > 0) {
-      return 'order by ' + orders.map(function(order) {
-        return '' + this.wrap(order.column) + ' ' + order.direction;
-      }, this).join(', ');
-    }
-  },
-
-  // Compiles the `limit` statements.
-  compileLimit: function(qb, limit) {
-    return 'limit ' + limit;
-  },
-
-  // Compiles an `offset` statement on the query.
-  compileOffset: function(qb, offset) {
-    return 'offset ' + offset;
-  },
-
-  // Compiles an `insert` query, allowing for multiple
-  // inserts using a single query statement.
-  compileInsert: function(qb) {
-    var values      = qb.values;
-    var table       = this.wrapTable(qb.table);
-    var columns     = _.pluck(values[0], 0);
-    var paramBlocks = [];
-
-    // If there are any "where" clauses, we need to omit
-    // any bindings that may have been associated with them.
-    if (qb.wheres.length > 0) this.clearWhereBindings(qb);
-
-    for (var i = 0, l = values.length; i < l; ++i) {
-      paramBlocks.push("(" + this.parameterize(_.pluck(values[i], 1)) + ")");
-    }
-
-    return "insert into " + table + " (" + this.columnize(columns) + ") values " + paramBlocks.join(', ');
-  },
-
-  // Depending on the type of `where` clause, this will appropriately
-  // remove any binding caused by "where" constraints, allowing the same
-  // query to be used for `insert` and `update` without issue.
-  clearWhereBindings: function(qb) {
-    var wheres = qb.wheres;
-    var bindingCount = 0;
-    for (var i = 0, l = wheres.length; i<l; i++) {
-      var where = wheres[i];
-      if (_.isArray(where.value)) {
-        bindingCount += where.value.length;
-      } else if (where.query) {
-        bindingCount += where.query.bindings.length;
-      } else {
-        bindingCount += 1;
-      }
-    }
-    qb.bindings = qb.bindings.slice(bindingCount);
-  },
-
-  // Compiles an `update` query.
-  compileUpdate: function(qb) {
-    var values = qb.values;
-    var table = this.wrapTable(qb.table), columns = [];
-    for (var i=0, l = values.length; i < l; i++) {
-      var value = values[i];
-      columns.push(this.wrap(value[0]) + ' = ' + this.parameter(value[1]));
-    }
-    return 'update ' + table + ' set ' + columns.join(', ') + ' ' + this.compileWheres(qb);
-  },
-
-  // Compiles a `delete` query.
-  compileDelete: function(qb) {
-    var table = this.wrapTable(qb.table);
-    var where = !_.isEmpty(qb.wheres) ? this.compileWheres(qb) : '';
-    return 'delete from ' + table + ' ' + where;
-  },
-
-  // Compiles a `truncate` query.
-  compileTruncate: function(qb) {
-    return 'truncate ' + this.wrapTable(qb.table);
-  },
-
-  // Adds a `for update` clause to the query, relevant with transactions.
-  compileForUpdate: function() {
-    return 'for update';
-  },
-
-  // Adds a `for share` clause to the query, relevant with transactions.
-  compileForShare: function() {
-    return 'for share';
-  },
-
-  // Puts the appropriate wrapper around a value depending on the database
-  // engine, unless it's a knex.raw value, in which case it's left alone.
-  wrap: function(value) {
-    var segments;
-    if (value instanceof Raw) return value.sql;
-    if (_.isNumber(value)) return value;
-    if (value.toLowerCase().indexOf(' as ') !== -1) {
-      segments = value.split(' ');
-      return this.wrap(segments[0]) + ' as ' + this.wrap(segments[2]);
-    }
-    var wrapped = [];
-    segments = value.split('.');
-    for (var i = 0, l = segments.length; i < l; i = ++i) {
-      value = segments[i];
-      if (i === 0 && segments.length > 1) {
-        wrapped.push(this.wrapTable(value));
-      } else {
-        wrapped.push(this.wrapValue(value));
-      }
-    }
-    return wrapped.join('.');
-  },
-
-  wrapArray: function(values) {
-    return _.map(values, this.wrap, this);
-  },
-
-  wrapTable: function(table) {
-    if (table instanceof Raw) return table.sql;
-    return this.wrap(table);
-  },
-
-  columnize: function(columns) {
-    if (!_.isArray(columns)) columns = [columns];
-    return _.map(columns, this.wrap, this).join(', ');
-  },
-
-  parameterize: function(values) {
-    if (!_.isArray(values)) values = [values];
-    return _.map(values, this.parameter, this).join(', ');
-  },
-
-  parameter: function(value) {
-    return (value instanceof Raw ? value.sql : '?');
-  }
-};
-
-},{"../../lib/helpers":16,"../../lib/raw":18,"lodash":62}],3:[function(require,module,exports){
-// SchemaGrammar
-// -------
-
-// The "SchemaGrammar" is a layer which helps in compiling
-// valid data definition language (DDL) statements in
-// to create, alter, or destroy the various tables, columns,
-// and metadata in our database schema. These functions
-// are combined with dialect specific "SchemaGrammar"
-// functions to keep the interface database agnostic.
-var _             = require('lodash');
-
-var baseGrammar   = require('./grammar').baseGrammar;
-var SchemaBuilder = require('../../lib/schemabuilder').SchemaBuilder;
-
-var Helpers       = require('../../lib/helpers').Helpers;
-var Raw           = require('../../lib/raw').Raw;
-
-exports.baseSchemaGrammar = {
-
-  // The toSql on the "schema" is different than that on the "builder",
-  // it produces an array of sql statements to be used in the creation
-  // or modification of the query, which are each run in sequence
-  // on the same connection.
-  toSql: function(builder) {
-
-    // Clone the builder, before we go about working with the columns & commands.
-    // TODO: Clean this up.
-    builder = builder.clone();
-
-    // Add the commands that are implied by the blueprint.
-    if (builder.columns.length > 0 && !builder.creating()) {
-      builder.commands.unshift({name: 'add'});
-    }
-
-    // Add an "additional" command, for any extra dialect-specific logic.
-    builder.commands.push({name: 'additional'});
-
-    // Add indicies
-    for (var i = 0, l = builder.columns.length; i < l; i++) {
-      var column = builder.columns[i];
-      var indices = ['primary', 'unique', 'index', 'foreign'];
-
-      continueIndex:
-      for (var i2 = 0, l2 = indices.length; i2 < l2; i2++) {
-        var index = indices[i2];
-        var indexVar = 'is' + Helpers.capitalize(index);
-
-        // If the index has been specified on the given column, but is simply
-        // equal to "true" (boolean), no name has been specified for this
-        // index, so we will simply call the index methods without one.
-        if (column[indexVar] === true) {
-          builder[index](column, null);
-          continue continueIndex;
-
-        // If the index has been specified on the column and it is something
-        // other than boolean true, we will assume a name was provided on
-        // the index specification, and pass in the name to the method.
-        } else if (_.has(column, indexVar)) {
-          builder[index](column.name, column[indexVar], column);
-          continue continueIndex;
-        }
-      }
-    }
-
-    var statements = [];
-
-    // Each type of command has a corresponding compiler function on the schema
-    // grammar which is used to build the necessary SQL statements to build
-    // the blueprint element, so we'll just call that compilers function.
-    for (i = 0, l = builder.commands.length; i < l; i++) {
-      var command = builder.commands[i];
-      var method = 'compile' + Helpers.capitalize(command.name);
-      if (_.has(this, method)) {
-        var sql = this[method](builder, command);
-        if (sql) statements = statements.concat(sql);
-      }
-    }
-
-    return statements;
-  },
-
-  // Compile a foreign key command.
-  compileForeign: function(blueprint, command) {
-    var sql;
-    if (command.foreignTable && command.foreignColumn) {
-      var table = this.wrapTable(blueprint);
-      var column = this.columnize(command.columns);
-      var foreignTable = this.wrapTable(command.foreignTable);
-      var foreignColumn = this.columnize(command.foreignColumn);
-
-      sql = "alter table " + table + " add constraint " + command.index + " ";
-      sql += "foreign key (" + column + ") references " + foreignTable + " (" + foreignColumn + ")";
-
-      // Once we have the basic foreign key creation statement constructed we can
-      // build out the syntax for what should happen on an update or delete of
-      // the affected columns, which will get something like "cascade", etc.
-      if (command.commandOnDelete) sql += " on delete " + command.commandOnDelete;
-      if (command.commandOnUpdate) sql += " on update " + command.commandOnUpdate;
-    }
-    return sql;
-  },
-
-  // Each of the column types have their own compiler functions which are
-  // responsible for turning the column definition into its SQL format
-  // for the platform. Then column modifiers are compiled and added.
-  getColumns: function(blueprint) {
-    var columns = [];
-    for (var i = 0, l = blueprint.columns.length; i < l; i++) {
-      var column = blueprint.columns[i];
-      var sql = this.wrap(column) + ' ' + this.getType(column, blueprint);
-      columns.push(this.addModifiers(sql, blueprint, column));
-    }
-    return columns;
-  },
-
-  // Add the column modifiers to the definition.
-  addModifiers: function(sql, blueprint, column) {
-    for (var i = 0, l = this.modifiers.length; i < l; i++) {
-      var modifier = this.modifiers[i];
-      var method = "modify" + modifier;
-      if (_.has(this, method)) {
-        sql += this[method](blueprint, column) || '';
-      }
-    }
-    return sql;
-  },
-
-  // Get the SQL for the column data type.
-  getType: function(column, blueprint) {
-    return this['type' + Helpers.capitalize(column.type)](column, blueprint);
-  },
-
-  // Add a prefix to an array of values, utilized in the client libs.
-  prefixArray: function(prefix, values) {
-    return _.map(values, function(value) { return prefix + ' ' + value; });
-  },
-
-  // Wrap a table in keyword identifiers.
-  wrapTable: function(table) {
-    if (table instanceof SchemaBuilder) table = table.table;
-    return baseGrammar.wrapTable.call(this, table);
-  },
-
-  // Wrap a value in keyword identifiers.
-  wrap: function(value) {
-    if (value && value.name) value = value.name;
-    return baseGrammar.wrap.call(this, value);
-  },
-
-  // Format a value so that it can be used in "default" clauses.
-  getDefaultValue: function(value) {
-    if (_.isObject(value) && value.sql) return value.sql;
-    if (value === true || value === false) {
-      value = parseInt(value, 10);
-    }
-    return "\'" + value + "\'";
-  },
-
-  // Get the primary key command if it exists on the blueprint.
-  getCommandByName: function(blueprint, name) {
-    var commands = this.getCommandsByName(blueprint, name);
-    if (commands.length > 0) return commands[0];
-  },
-
-  // Get all of the commands with a given name.
-  getCommandsByName: function(blueprint, name) {
-    return _.filter(blueprint.commands, function(value) { return value.name == name; }) || [];
-  },
-
-  // Used to compile any database specific items.
-  compileAdditional: function() {},
-
-  // Compile a create table command.
-  compileCreateTable: function(blueprint) {
-    var columns = this.getColumns(blueprint).join(', ');
-    return 'create table ' + this.wrapTable(blueprint) + ' (' + columns + ')';
-  },
-
-  // Compile a drop table command.
-  compileDropTable: function(blueprint) {
-    return 'drop table ' + this.wrapTable(blueprint);
-  },
-
-  // Compile a drop table (if exists) command.
-  compileDropTableIfExists: function(blueprint) {
-    return 'drop table if exists ' + this.wrapTable(blueprint);
-  },
-
-  // Compile a drop index command.
-  compileDropIndex: function(blueprint, command) {
-    return 'drop index ' + command.index;
-  },
-
-  // Default for a biginteger type in database in other databases.
-  typeBigInteger: function(column) {
-    return this.typeInteger(column);
-  },
-
-  // Create the column definition for a string type.
-  typeString: function(column) {
-    return "varchar(" + column.length + ")";
-  },
-
-  // Create the column definition for a text type.
-  typeText: function() {
-    return 'text';
-  },
-
-  // Create the column definition for a tiny integer type.
-  typeTinyInteger: function() {
-    return 'tinyint';
-  },
-
-  // Create the column definition for a time type.
-  typeTime: function() {
-    return 'time';
-  },
-
-  // Create the column definition for a date type.
-  typeDate: function() {
-    return 'date';
-  },
-
-  // Create the column definition for a binary type.
-  typeBinary: function() {
-    return 'blob';
-  },
-
-  // Create the column definition for a json type.
-  typeJson: function() {
-    return 'text';
-  },
-
-  // Create the column definition for a uuid type.
-  typeUuid: function() {
-    return 'char(36)';
-  },
-
-  // Create a specific type
-  typeSpecificType: function(column) {
-    return column.specific;
-  },
-
-  // Get the SQL for a nullable column modifier.
-  modifyNullable: function(blueprint, column) {
-    if (column.isNullable === false) {
-      return ' not null';
-    }
-  },
-
-  // Get the SQL for a default column modifier.
-  modifyDefault: function(blueprint, column) {
-    if (column.defaultValue != void 0) {
-      return " default " + this.getDefaultValue(column.defaultValue);
-    }
+require=(function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);throw new Error("Cannot find module '"+o+"'")}var f=n[o]={exports:{}};t[o][0].call(f.exports,function(e){var n=t[o][1][e];return s(n?n:e)},f,f.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({"O1bulJ":[function(require,module,exports){
+// Bookshelf.js 0.6.8
+// ---------------
+
+//     (c) 2013 Tim Griesser
+//     Bookshelf may be freely distributed under the MIT license.
+//     For all details and documentation:
+//     http://bookshelfjs.org
+
+// All external libraries needed in this scope.
+var _          = require('lodash');
+var Knex       = require('knex');
+
+// All local dependencies... These are the main objects that
+// need to be augmented in the constructor to work properly.
+var SqlModel      = require('./dialects/sql/model').Model;
+var SqlCollection = require('./dialects/sql/collection').Collection;
+var SqlRelation   = require('./dialects/sql/relation').Relation;
+
+// Finally, the `Events`, which we've supplemented with a `triggerThen`
+// method to allow for asynchronous event handling via promises. We also
+// mix this into the prototypes of the main objects in the library.
+var Events        = require('./dialects/base/events').Events;
+
+// Constructor for a new `Bookshelf` object, it accepts
+// an active `knex` instance and initializes the appropriate
+// `Model` and `Collection` constructors for use in the current instance.
+var Bookshelf = function(knex) {
+
+  // Allows you to construct the library with either `Bookshelf(opts)`
+  // or `new Bookshelf(opts)`.
+  if (!(this instanceof Bookshelf)) {
+    return new Bookshelf(knex);
   }
 
+  // If the knex isn't a `Knex` instance, we'll assume it's
+  // a compatible config object and pass it through to create a new instance.
+  if (!knex.client || !(knex.client instanceof Knex.ClientBase)) {
+    knex = new Knex(knex);
+  }
+
+  // The `Model` constructor is referenced as a property on the `Bookshelf` instance,
+  // mixing in the correct `builder` method, as well as the `relation` method,
+  // passing in the correct `Model` & `Collection` constructors for later reference.
+  var ModelCtor = this.Model = SqlModel.extend({
+    _builder: function(tableName) {
+      return knex(tableName);
+    },
+    _relation: function(type, Target, options) {
+      if (type !== 'morphTo' && !_.isFunction(Target)) {
+        throw new Error('A valid target model must be defined for the ' +
+          _.result(this, 'tableName') + ' ' + type + 'relation');
+      }
+      return new Relation(type, Target, options);
+    }
+  });
+
+  // Shortcut for creating a new collection with the current collection.
+  ModelCtor.collection = function(rows, options) {
+    return new CollectionCtor((rows || []), _.extend({}, options, {model: this}));
+  };
+
+  // The collection also references the correct `Model`, specified above, for creating
+  // new `Model` instances in the collection. We also extend with the correct builder /
+  // `knex` combo.
+  var CollectionCtor = this.Collection = SqlCollection.extend({
+    model: ModelCtor,
+    _builder: function(tableName) {
+      return knex(tableName);
+    }
+  });
+
+  // Used internally, the `Relation` helps in simplifying the relationship building,
+  // centralizing all logic dealing with type & option handling.
+  var Relation = Bookshelf.Relation = SqlRelation.extend({
+    Model: ModelCtor,
+    Collection: CollectionCtor
+  });
+
+  // Grab a reference to the `knex` instance passed (or created) in this constructor,
+  // for convenience.
+  this.knex = knex;
 };
 
-},{"../../lib/helpers":16,"../../lib/raw":18,"../../lib/schemabuilder":19,"./grammar":2,"lodash":62}],4:[function(require,module,exports){
-// SQLite3 Grammar
-// -------
+// A `Bookshelf` instance may be used as a top-level pub-sub bus, as it mixes in the
+// `Events` object. It also contains the version number, and a `Transaction` method
+// referencing the correct version of `knex` passed into the object.
+_.extend(Bookshelf.prototype, Events, {
 
-// The SQLite3 base is a bit different than the other clients,
-// in that it may be run on both the client and server. So add another
-// layer to the prototype chain.
-var _           = require('lodash');
-var Helpers     = require('../../../lib/helpers').Helpers;
-var baseGrammar = require('../grammar').baseGrammar;
+  // Keep in sync with `package.json`.
+  VERSION: '0.6.8',
 
-// Extends the standard sql grammar, with any SQLite specific
-// dialect oddities.
-exports.grammar = _.defaults({
-
-  // The keyword identifier wrapper format.
-  wrapValue: function(value) {
-    return (value !== '*' ? Helpers.format('"%s"', value) : "*");
+  // Helper method to wrap a series of Bookshelf actions in a `knex` transaction block;
+  transaction: function() {
+    return this.knex.transaction.apply(this, arguments);
   },
 
-  // Compile the "order by" portions of the query.
-  compileOrders: function(qb, orders) {
-    if (orders.length === 0) return;
-    return "order by " + orders.map(function(order) {
-      return this.wrap(order.column) + " collate nocase " + order.direction;
-    }, this).join(', ');
-  },
-
-  // Compile an insert statement into SQL.
-  compileInsert: function(qb) {
-    var values  = qb.values;
-    var table   = this.wrapTable(qb.table);
-    var columns = _.pluck(values[0], 0);
-
-    // If there are any "where" clauses, we need to omit
-    // any bindings that may have been associated with them.
-    if (qb.wheres.length > 0) this.clearWhereBindings(qb);
-
-    // If there is only one record being inserted, we will just use the usual query
-    // grammar insert builder because no special syntax is needed for the single
-    // row inserts in SQLite. However, if there are multiples, we'll continue.
-    if (values.length === 1) {
-      var sql = 'insert into ' + table + ' ';
-      if (columns.length === 0) {
-        sql += 'default values';
-      } else {
-        sql += "(" + this.columnize(columns) + ") values " + "(" + this.parameterize(_.pluck(values[0], 1)) + ")";
+  // Provides a nice, tested, standardized way of adding plugins to a `Bookshelf` instance,
+  // injecting the current instance into the plugin, which should be a module.exports.
+  plugin: function(plugin, options) {
+    if (_.isString(plugin)) {
+      try {
+        require('./plugins/' + plugin)(this, options);
+      } catch (e) {
+        require(plugin)(this, options);
       }
-      return sql;
-    }
-
-    var blocks = [];
-
-    // SQLite requires us to build the multi-row insert as a listing of select with
-    // unions joining them together. So we'll build out this list of columns and
-    // then join them all together with select unions to complete the queries.
-    for (var i = 0, l = columns.length; i < l; i++) {
-      blocks.push('? as ' + this.wrap(columns[i]));
-    }
-
-    var joinedColumns = blocks.join(', ');
-    blocks = [];
-    for (i = 0, l = values.length; i < l; i++) {
-      blocks.push(joinedColumns);
-    }
-
-    return "insert into " + table + " (" + this.columnize(columns) + ") select " + blocks.join(' union all select ');
-  },
-
-  // Compile a truncate table statement into SQL.
-  compileTruncate: function (qb) {
-    var sql = [];
-    var table = this.wrapTable(qb.table);
-    sql.push('delete from sqlite_sequence where name = ' + table);
-    sql.push('delete from ' + table);
-    return sql;
-  },
-
-  // For share and for update are not available in sqlite3.
-  compileForUpdate: function() {},
-  compileForShare:  function() {}
-
-}, baseGrammar);
-
-},{"../../../lib/helpers":16,"../grammar":2,"lodash":62}],5:[function(require,module,exports){
-// SQLite3 SchemaGrammar
-// -------
-
-var _                 = require('lodash');
-var grammar           = require('./grammar').grammar;
-var baseSchemaGrammar = require('../schemagrammar').baseSchemaGrammar;
-
-// Grammar for the schema builder.
-exports.schemaGrammar = _.defaults({
-
-  // The possible column modifiers.
-  modifiers: ['Nullable', 'Default', 'Increment'],
-
-  // Returns the cleaned bindings for the current query.
-  getBindings: function(builder) {
-    if (builder.type === 'columnExists') return [];
-    return grammar.getBindings(builder);
-  },
-
-  // Compile the query to determine if a table exists.
-  compileTableExists: function() {
-    return "select * from sqlite_master where type = 'table' and name = ?";
-  },
-
-  // Compile the query to determine if a column exists.
-  compileColumnExists: function(builder) {
-    return "PRAGMA table_info(" + this.wrapTable(builder) + ")";
-  },
-
-  // Compile a create table command.
-  compileCreateTable: function(builder) {
-    var columns = this.getColumns(builder).join(', ');
-    var sql = 'create table ' + this.wrapTable(builder) + ' (' + columns;
-
-    // SQLite forces primary keys to be added when the table is initially created
-    // so we will need to check for a primary key commands and add the columns
-    // to the table's declaration here so they can be created on the tables.
-    sql += this.addForeignKeys(builder);
-    sql += this.addPrimaryKeys(builder) || '';
-    sql +=')';
-
-    return sql;
-  },
-
-  // Get the foreign key syntax for a table creation statement.
-  // Once we have all the foreign key commands for the table creation statement
-  // we'll loop through each of them and add them to the create table SQL we
-  // are building, since SQLite needs foreign keys on the tables creation.
-  addForeignKeys: function(builder) {
-    var sql = '';
-    var commands = this.getCommandsByName(builder, 'foreign');
-    for (var i = 0, l = commands.length; i < l; i++) {
-      var command = commands[i];
-      var column = this.columnize(command.columns);
-      var foreignTable = this.wrapTable(command.foreignTable);
-      var foreignColumn = this.columnize([command.foreignColumn]);
-      sql += ', foreign key(' + column + ') references ' + foreignTable + '(' + foreignColumn + ')';
-    }
-    return sql;
-  },
-
-  // Get the primary key syntax for a table creation statement.
-  addPrimaryKeys: function(builder) {
-    var primary = this.getCommandByName(builder, 'primary');
-    if (primary) {
-      // Ensure that autoincrement columns aren't handled here, this is handled
-      // alongside the autoincrement clause.
-      primary.columns = _.reduce(primary.columns, function(memo, column) {
-        if (column.autoIncrement !== true) memo.push(column);
-        return memo;
-      }, []);
-      if (primary.columns.length > 0) {
-        var columns = this.columnize(primary.columns);
-        return ', primary key (' + columns + ')';
-      }
-    }
-  },
-
-  // Compile alter table commands for adding columns
-  compileAdd: function(builder) {
-    var table = this.wrapTable(builder);
-    var columns = this.prefixArray('add column', this.getColumns(builder));
-    var statements = [];
-    for (var i = 0, l = columns.length; i < l; i++) {
-      statements.push('alter table ' + table + ' ' + columns[i]);
-    }
-    return statements;
-  },
-
-  // Compile a unique key command.
-  compileUnique: function(builder, command) {
-    var columns = this.columnize(command.columns);
-    var table = this.wrapTable(builder);
-    return 'create unique index ' + command.index + ' on ' + table + ' (' + columns + ')';
-  },
-
-  // Compile a plain index key command.
-  compileIndex: function(builder, command) {
-    var columns = this.columnize(command.columns);
-    var table = this.wrapTable(builder);
-    return 'create index ' + command.index + ' on ' + table + ' (' + columns + ')';
-  },
-
-  // Compile a foreign key command.
-  compileForeign: function() {
-    // Handled on table creation...
-  },
-
-  // Compile a drop column command.
-  compileDropColumn: function() {
-    throw new Error("Drop column not supported for SQLite.");
-  },
-
-  // Compile a drop unique key command.
-  compileDropUnique: function(builder, command) {
-    return 'drop index ' + command.index;
-  },
-
-  // Compile a rename table command.
-  compileRenameTable: function(builder, command) {
-    return 'alter table ' + this.wrapTable(builder) + ' rename to ' + this.wrapTable(command.to);
-  },
-
-  // Compile a rename column command.
-  compileRenameColumn: function(builder, command) {
-    return '__rename_column__';
-  },
-
-  // Create the column definition for a integer type.
-  typeInteger: function() {
-    return 'integer';
-  },
-
-  // Create the column definition for a float type.
-  typeFloat: function() {
-    return 'float';
-  },
-
-  // Create the column definition for a decimal type.
-  typeDecimal: function() {
-    return 'float';
-  },
-
-  // Create the column definition for a boolean type.
-  typeBoolean: function() {
-    return 'tinyint';
-  },
-
-  // Create the column definition for a enum type.
-  typeEnum: function() {
-    return 'varchar';
-  },
-
-  // Create the column definition for a date-time type.
-  typeDateTime: function() {
-    return 'datetime';
-  },
-
-  // Create the column definition for a timestamp type.
-  typeTimestamp: function() {
-    return 'datetime';
-  },
-
-  // Get the SQL for an auto-increment column modifier.
-  modifyIncrement: function(builder, column) {
-    if (column.autoIncrement && (column.type == 'integer' || column.type == 'bigInteger')) {
-      return ' primary key autoincrement not null';
-    }
-  }
-}, baseSchemaGrammar, grammar);
-
-},{"../schemagrammar":3,"./grammar":4,"lodash":62}],6:[function(require,module,exports){
-// Pool
-// -------
-var Promise     = require('../lib/promise').Promise;
-
-var _           = require('lodash');
-var GenericPool = require('generic-pool-redux').Pool;
-
-var Helpers     = require('../lib/helpers').Helpers;
-
-// The "Pool" object is a thin wrapper around the
-// "generic-pool-redux" library, exposing a `destroy`
-// method for explicitly draining the pool. The
-// `init` method is called internally and initializes
-// the pool if it doesn't already exist.
-var Pool = function(config, client) {
-  _.bindAll(this, 'acquire', 'release');
-  this.config = config;
-  this.client = client;
-  if (!config || !client) {
-    throw new Error('The config and client are required to use the pool module.');
-  }
-  this.init();
-};
-
-Pool.prototype = {
-
-  // Some basic defaults for the pool...
-  defaults: function() {
-    var pool = this;
-    return {
-      min: 2,
-      max: 10,
-      create: function(callback) {
-        var promise = pool.client.getRawConnection()
-          .tap(function(connection) {
-            connection.__cid = _.uniqueId('__cid');
-            if (pool.config.afterCreate) {
-              return Promise.promisify(pool.config.afterCreate)(connection);
-            }
-          });
-        return promise.nodeify(callback);
-      },
-      destroy: function(connection) {
-        if (pool.config.beforeDestroy) {
-          return pool.config.beforeDestroy(connection, function() {
-            connection.end();
-          });
-        }
-        connection.end();
-      }
-    };
-  },
-
-  // Typically only called internally, this initializes
-  // a new `GenericPool` instance, based on the `config`
-  // options passed into the constructor.
-  init: function(config) {
-    if (config) this.config = _.extend(this.config, config);
-    this.poolInstance = this.poolInstance || new GenericPool(_.defaults(this.config, _.result(this, 'defaults')));
-    return this.poolInstance;
-  },
-
-  // Acquires a connection from the pool.
-  acquire: function(callback, priority) {
-    return (this.poolInstance || this.init()).acquire(callback, priority);
-  },
-
-  // Release a connection back to the connection pool.
-  release: function(connection, callback) {
-    this.poolInstance.release(connection, callback);
-  },
-
-  // Tear down the pool, only necessary if you need it.
-  destroy: function(callback) {
-    var poolInstance = this.poolInstance;
-    if (poolInstance) {
-      poolInstance.drain(function() {
-        poolInstance.destroyAllNow(callback);
-      });
-      delete this.poolInstance;
+    } else if (_.isArray(plugin)) {
+      _.each(plugin, function (plugin) {
+        this.plugin(plugin, options);
+      }, this);
     } else {
-      callback();
+      plugin(this, options);
     }
     return this;
   }
 
+});
+
+// Alias to `new Bookshelf(opts)`.
+Bookshelf.initialize = function(knex) {
+  return new this(knex);
 };
 
-// Grab the standard `Object.extend` as popularized by Backbone.js.
-Pool.extend = Helpers.extend;
+// The `forge` function properly instantiates a new Model or Collection
+// without needing the `new` operator... to make object creation cleaner
+// and more chainable.
+SqlModel.forge = SqlCollection.forge = function() {
+  var inst = Object.create(this.prototype);
+  var obj = this.apply(inst, arguments);
+  return (Object(obj) === obj ? obj : inst);
+};
 
-exports.Pool = Pool;
+// Finally, export `Bookshelf` to the world.
+module.exports = Bookshelf;
 
-},{"../lib/helpers":16,"../lib/promise":17,"generic-pool-redux":61,"lodash":62}],7:[function(require,module,exports){
-// ServerBase
-// -------
+},{"./dialects/base/events":5,"./dialects/sql/collection":9,"./dialects/sql/model":12,"./dialects/sql/relation":13,"lodash":55}],"bookshelf":[function(require,module,exports){
+module.exports=require('O1bulJ');
+},{}],3:[function(require,module,exports){
+// Base Collection
+// ---------------
 
-var _          = require('lodash');
+// All exernal dependencies required in this scope.
+var _         = require('lodash');
+var Backbone  = require('backbone');
 
-var Pool       = require('../pool').Pool;
-var ClientBase = require('../base').ClientBase;
-var Promise    = require('../../lib/promise').Promise;
+// All components that need to be referenced in this scope.
+var Events    = require('./events').Events;
+var Promise   = require('./promise').Promise;
+var ModelBase = require('./model').ModelBase;
 
-var ServerBase = ClientBase.extend({
+var array  = [];
+var push   = array.push;
+var splice = array.splice;
 
-  // Pass a config object into the constructor,
-  // which then initializes the pool and
-  constructor: function(config) {
-    if (config.debug) this.isDebugging = true;
-    this.attachGrammars();
-    this.connectionSettings = config.connection;
-    this.initPool(config.pool);
-    _.bindAll(this, 'getRawConnection');
+var CollectionBase = function(models, options) {
+  if (options) _.extend(this, _.pick(options, collectionProps));
+  this._reset();
+  this.initialize.apply(this, arguments);
+  if (!_.isFunction(this.model)) {
+    throw new Error('A valid `model` constructor must be defined for all collections.');
+  }
+  if (models) this.reset(models, _.extend({silent: true}, options));
+};
+
+// List of attributes attached directly from the constructor's options object.
+var collectionProps   = ['model', 'comparator'];
+
+// A list of properties that are omitted from the `Backbone.Model.prototype`, to create
+// a generic collection base.
+var collectionOmitted = ['model', 'fetch', 'url', 'sync', 'create'];
+
+// Copied over from Backbone.
+var setOptions = {add: true, remove: true, merge: true};
+
+_.extend(CollectionBase.prototype, _.omit(Backbone.Collection.prototype, collectionOmitted), Events, {
+
+  // The `tableName` on the associated Model, used in relation building.
+  tableName: function() {
+    return _.result(this.model.prototype, 'tableName');
   },
 
-  // Initialize a pool with the apporpriate configuration and
-  // bind the pool to the current client object.
-  initPool: function(poolConfig) {
-    this.pool = new Pool(_.extend({}, _.result(this, 'poolDefaults'), poolConfig), this);
+  // The `idAttribute` on the associated Model, used in relation building.
+  idAttribute: function() {
+    return this.model.prototype.idAttribute;
   },
 
-  // Execute a query on the specified Builder or QueryBuilder
-  // interface. If a `connection` is specified, use it, otherwise
-  // acquire a connection, and then dispose of it when we're done.
-  query: Promise.method(function(builder) {
-    var conn, client = this;
-    var sql        = builder.toSql(builder);
-    var bindings   = builder.getBindings();
+  // A simplified version of Backbone's `Collection#set` method,
+  // removing the comparator, and getting rid of the temporary model creation,
+  // since there's *no way* we'll be getting the data in an inconsistent
+  // form from the database.
+  set: function(models, options) {
+    options = _.defaults({}, options, setOptions);
+    if (options.parse) models = this.parse(models, options);
+    if (!_.isArray(models)) models = models ? [models] : [];
+    var i, l, id, model, attrs, existing;
+    var at = options.at;
+    var targetModel = this.model;
+    var toAdd = [], toRemove = [], modelMap = {};
+    var add = options.add, merge = options.merge, remove = options.remove;
+    var order = add && remove ? [] : false;
 
-    var chain = this.getConnection(builder).then(function(connection) {
-      if (client.isDebugging || builder.flags.debug) {
-        client.debug(sql, bindings, connection, builder);
+    // Turn bare objects into model references, and prevent invalid models
+    // from being added.
+    for (i = 0, l = models.length; i < l; i++) {
+      attrs = models[i];
+      if (attrs instanceof ModelBase) {
+        id = model = attrs;
+      } else {
+        id = attrs[targetModel.prototype.idAttribute];
       }
-      conn = connection;
-      if (_.isArray(sql)) {
-        var current = Promise.fulfilled();
-        return Promise.map(sql, function(query, i) {
-          current = current.then(function () {
-            builder.currentIndex = i;
-            return client.runQuery(connection, query, bindings, builder);
-          });
-          return current;
-        });
+
+      // If a duplicate is found, prevent it from being added and
+      // optionally merge it into the existing model.
+      if (existing = this.get(id)) {
+        if (remove) {
+          modelMap[existing.cid] = true;
+          continue;
+        }
+        if (merge) {
+          attrs = attrs === model ? model.attributes : attrs;
+          if (options.parse) attrs = existing.parse(attrs, options);
+          existing.set(attrs, options);
+        }
+
+        // This is a new model, push it to the `toAdd` list.
+      } else if (add) {
+        if (!(model = this._prepareModel(attrs, options))) continue;
+        toAdd.push(model);
+
+        // Listen to added models' events, and index models for lookup by
+        // `id` and by `cid`.
+        model.on('all', this._onModelEvent, this);
+        this._byId[model.cid] = model;
+        if (model.id != null) this._byId[model.id] = model;
       }
-      return client.runQuery(connection, sql, bindings, builder);
+      if (order) order.push(existing || model);
+    }
+
+    // Remove nonexistent models if appropriate.
+    if (remove) {
+      for (i = 0, l = this.length; i < l; ++i) {
+        if (!modelMap[(model = this.models[i]).cid]) toRemove.push(model);
+      }
+      if (toRemove.length) this.remove(toRemove, options);
+    }
+
+    // See if sorting is needed, update `length` and splice in new models.
+    if (toAdd.length || (order && order.length)) {
+      this.length += toAdd.length;
+      if (at != null) {
+        splice.apply(this.models, [at, 0].concat(toAdd));
+      } else {
+        if (order) this.models.length = 0;
+        push.apply(this.models, order || toAdd);
+      }
+    }
+
+    if (options.silent) return this;
+
+    // Trigger `add` events.
+    for (i = 0, l = toAdd.length; i < l; i++) {
+      (model = toAdd[i]).trigger('add', model, this, options);
+    }
+    return this;
+  },
+
+  // Prepare a model or hash of attributes to be added to this collection.
+  _prepareModel: function(attrs, options) {
+    if (attrs instanceof ModelBase) return attrs;
+    return new this.model(attrs, options);
+  },
+
+  // Run "Promise.map" over the models
+  mapThen: function(iterator, context) {
+    return Promise.bind(context).thenReturn(this.models).map(iterator);
+  },
+
+  // Convenience method for invoke, returning a `Promise.all` promise.
+  invokeThen: function() {
+    return Promise.all(this.invoke.apply(this, arguments));
+  },
+
+  // Run "reduce" over the models in the collection.
+  reduceThen: function(iterator, initialValue, context) {
+    return Promise.bind(context).thenReturn(this.models).reduce(iterator, initialValue).bind();
+  },
+
+  fetch: function() {
+    return Promise.rejected('The fetch method has not been implemented');
+  }
+
+});
+
+// List of attributes attached directly from the `options` passed to the constructor.
+var modelProps = ['tableName', 'hasTimestamps'];
+
+CollectionBase.extend = Backbone.Collection.extend;
+
+// Helper to mixin one or more additional items to the current prototype.
+CollectionBase.include = function() {
+  _.extend.apply(_, [this.prototype].concat(_.toArray(arguments)));
+  return this;
+};
+
+exports.CollectionBase = CollectionBase;
+},{"./events":5,"./model":6,"./promise":7,"backbone":15,"lodash":55}],4:[function(require,module,exports){
+// Eager Base
+// ---------------
+
+// The EagerBase provides a scaffold for handling with eager relation
+// pairing, by queueing the appropriate related method calls with
+// a database specific `eagerFetch` method, which then may utilize
+// `pushModels` for pairing the models depending on the database need.
+
+var _         = require('lodash');
+var Backbone  = require('backbone');
+var Promise   = require('./promise').Promise;
+
+var EagerBase = function(parent, parentResponse, target) {
+  this.parent = parent;
+  this.parentResponse = parentResponse;
+  this.target = target;
+};
+
+_.extend(EagerBase.prototype, {
+
+  // This helper function is used internally to determine which relations
+  // are necessary for fetching based on the `model.load` or `withRelated` option.
+  fetch: Promise.method(function(options) {
+    var relationName, related, relation;
+    var target      = this.target;
+    var handled     = this.handled = {};
+    var withRelated = this.prepWithRelated(options.withRelated);
+    var subRelated  = {};
+
+    // Internal flag to determine whether to set the ctor(s) on the `Relation` object.
+    target._isEager = true;
+
+    // Eager load each of the `withRelated` relation item, splitting on '.'
+    // which indicates a nested eager load.
+    for (var key in withRelated) {
+
+      related = key.split('.');
+      relationName = related[0];
+
+      // Add additional eager items to an array, to load at the next level in the query.
+      if (related.length > 1) {
+        var relatedObj = {};
+        subRelated[relationName] || (subRelated[relationName] = []);
+        relatedObj[related.slice(1).join('.')] = withRelated[key];
+        subRelated[relationName].push(relatedObj);
+      }
+
+      // Only allow one of a certain nested type per-level.
+      if (handled[relationName]) continue;
+
+      relation = target[relationName]();
+
+      if (!relation) throw new Error(relationName + ' is not defined on the model.');
+
+      handled[relationName] = relation;
+    }
+
+    // Delete the internal flag from the model.
+    delete target._isEager;
+
+    // Fetch all eager loaded models, loading them onto
+    // an array of pending deferred objects, which will handle
+    // all necessary pairing with parent objects, etc.
+    var pendingDeferred = [];
+    for (relationName in handled) {
+      pendingDeferred.push(this.eagerFetch(relationName, handled[relationName], _.extend({}, options, {
+        isEager: true,
+        withRelated: subRelated[relationName],
+        beforeFn: withRelated[relationName] || noop
+      })));
+    }
+
+    // Return a deferred handler for all of the nested object sync
+    // returning the original response when these syncs & pairings are complete.
+    return Promise.all(pendingDeferred).yield(this.parentResponse);
+  }),
+
+  // Prep the `withRelated` object, to normalize into an object where each
+  // has a function that is called when running the query.
+  prepWithRelated: function(withRelated) {
+    if (!_.isArray(withRelated)) withRelated = [withRelated];
+    var obj = {};
+    for (var i = 0, l = withRelated.length; i < l; i++) {
+      var related = withRelated[i];
+      _.isString(related) ? obj[related] = noop : _.extend(obj, related);
+    }
+    return obj;
+  },
+
+  // Pushes each of the incoming models onto a new `related` array,
+  // which is used to correcly pair additional nested relations.
+  pushModels: function(relationName, handled, resp) {
+    var models      = this.parent;
+    var relatedData = handled.relatedData;
+    var related     = [];
+    for (var i = 0, l = resp.length; i < l; i++) {
+      related.push(relatedData.createModel(resp[i]));
+    }
+    return relatedData.eagerPair(relationName, related, models);
+  }
+
+});
+
+var noop = function() {};
+
+EagerBase.extend = Backbone.Model.extend;
+
+exports.EagerBase = EagerBase;
+
+},{"./promise":7,"backbone":15,"lodash":55}],5:[function(require,module,exports){
+// Events
+// ---------------
+
+var Promise     = require('./promise').Promise;
+var Backbone    = require('backbone');
+var triggerThen = require('trigger-then');
+
+// Mixin the `triggerThen` function into all relevant Backbone objects,
+// so we can have event driven async validations, functions, etc.
+triggerThen(Backbone, Promise);
+
+exports.Events = Backbone.Events;
+},{"./promise":7,"backbone":15,"trigger-then":56}],6:[function(require,module,exports){
+// Base Model
+// ---------------
+var _        = require('lodash');
+var Backbone = require('backbone');
+
+var Events   = require('./events').Events;
+var Promise  = require('./promise').Promise;
+
+// A list of properties that are omitted from the `Backbone.Model.prototype`, to create
+// a generic model base.
+var modelOmitted = [
+  'changedAttributes', 'isValid', 'validationError',
+  'save', 'sync', 'fetch', 'destroy', 'url',
+  'urlRoot', '_validate'
+];
+
+// List of attributes attached directly from the `options` passed to the constructor.
+var modelProps = ['tableName', 'hasTimestamps'];
+
+// The "ModelBase" is similar to the 'Active Model' in Rails,
+// it defines a standard interface from which other objects may
+// inherit.
+var ModelBase = function(attributes, options) {
+  var attrs = attributes || {};
+  options || (options = {});
+  this.attributes = Object.create(null);
+  this._reset();
+  this.relations = {};
+  this.cid  = _.uniqueId('c');
+  if (options) {
+    _.extend(this, _.pick(options, modelProps));
+    if (options.parse) attrs = this.parse(attrs, options) || {};
+  }
+  this.set(attrs, options);
+  this.initialize.apply(this, arguments);
+};
+
+_.extend(ModelBase.prototype, _.omit(Backbone.Model.prototype, modelOmitted), Events, {
+
+  // Similar to the standard `Backbone` set method, but without individual
+  // change events, and adding different meaning to `changed` and `previousAttributes`
+  // defined as the last "sync"'ed state of the model.
+  set: function(key, val, options) {
+    if (key == null) return this;
+    var attrs;
+
+    // Handle both `"key", value` and `{key: value}` -style arguments.
+    if (typeof key === 'object') {
+      attrs = key;
+      options = val;
+    } else {
+      (attrs = {})[key] = val;
+    }
+    options || (options = {});
+
+    // Extract attributes and options.
+    var hasChanged = false;
+    var unset   = options.unset;
+    var current = this.attributes;
+    var prev    = this._previousAttributes;
+
+    // Check for changes of `id`.
+    if (this.idAttribute in attrs) this.id = attrs[this.idAttribute];
+
+    // For each `set` attribute, update or delete the current value.
+    for (var attr in attrs) {
+      val = attrs[attr];
+      if (!_.isEqual(prev[attr], val)) {
+        this.changed[attr] = val;
+        if (!_.isEqual(current[attr], val)) hasChanged = true;
+      } else {
+        delete this.changed[attr];
+      }
+      unset ? delete current[attr] : current[attr] = val;
+    }
+
+    if (hasChanged && !options.silent) this.trigger('change', this, options);
+    return this;
+  },
+
+  // Returns an object containing a shallow copy of the model attributes,
+  // along with the `toJSON` value of any relations,
+  // unless `{shallow: true}` is passed in the `options`.
+  toJSON: function(options) {
+    var attrs = _.extend({}, this.attributes);
+    if (options && options.shallow) return attrs;
+    var relations = this.relations;
+    for (var key in relations) {
+      var relation = relations[key];
+      attrs[key] = relation.toJSON ? relation.toJSON() : relation;
+    }
+    if (this.pivot) {
+      var pivot = this.pivot.attributes;
+      for (key in pivot) {
+        attrs['_pivot_' + key] = pivot[key];
+      }
+    }
+    return attrs;
+  },
+
+  // **parse** converts a response into the hash of attributes to be `set` on
+  // the model. The default implementation is just to pass the response along.
+  parse: function(resp, options) {
+    return resp;
+  },
+
+  // **format** converts a model into the values that should be saved into
+  // the database table. The default implementation is just to pass the data along.
+  format: function(attrs, options) {
+    return attrs;
+  },
+
+  // Returns the related item, or creates a new
+  // related item by creating a new model or collection.
+  related: function(name) {
+    return this.relations[name] || (this[name] ? this.relations[name] = this[name]() : void 0);
+  },
+
+  // Create a new model with identical attributes to this one,
+  // including any relations on the current model.
+  clone: function() {
+    var model = new this.constructor(this.attributes);
+    var relations = this.relations;
+    for (var key in relations) {
+      model.relations[key] = relations[key].clone();
+    }
+    model._previousAttributes = _.clone(this._previousAttributes);
+    model.changed = _.clone(this.changed);
+    return model;
+  },
+
+  // Sets the timestamps before saving the model.
+  timestamp: function(options) {
+    var d = new Date();
+    var keys = (_.isArray(this.hasTimestamps) ? this.hasTimestamps : ['created_at', 'updated_at']);
+    var vals = {};
+    if (keys[1]) vals[keys[1]] = d;
+    if (this.isNew(options) && keys[0] && (!options || options.method !== 'update')) vals[keys[0]] = d;
+    return vals;
+  },
+
+  // Called after a `sync` action (save, fetch, delete) -
+  // resets the `_previousAttributes` and `changed` hash for the model.
+  _reset: function() {
+    this._previousAttributes = _.extend(Object.create(null), this.attributes);
+    this.changed = Object.create(null);
+    return this;
+  },
+
+  fetch: function() {},
+
+  save: function() {},
+
+  // Destroy a model, calling a "delete" based on its `idAttribute`.
+  // A "destroying" and "destroyed" are triggered on the model before
+  // and after the model is destroyed, respectively. If an error is thrown
+  // during the "destroying" event, the model will not be destroyed.
+  destroy: Promise.method(function(options) {
+    options = options ? _.clone(options) : {};
+
+    var sync = this.sync(options);
+    options.query = sync.query;
+
+    return Promise.bind(this).then(function() {
+      return this.triggerThen('destroying', this, options);
+    }).then(function() {
+      return sync.del();
+    }).then(function(resp) {
+      this.clear();
+      return this.triggerThen('destroyed', this, resp, options);
+    }).then(this._reset);
+  })
+
+});
+
+ModelBase.extend  = Backbone.Model.extend;
+
+// Helper to mixin one or more additional items to the current prototype.
+ModelBase.include = function() {
+  _.extend.apply(_, [this.prototype].concat(_.toArray(arguments)));
+  return this;
+};
+
+exports.ModelBase = ModelBase;
+
+},{"./events":5,"./promise":7,"backbone":15,"lodash":55}],7:[function(require,module,exports){
+
+var Promise = require('bluebird/js/main/promise')();
+
+Promise.prototype.yield = function(value) {
+  return this.then(function() {
+    return value;
+  });
+};
+
+Promise.prototype.tap = function(handler) {
+  return this.then(handler).yield(this);
+};
+
+Promise.prototype.ensure = Promise.prototype.lastly;
+Promise.prototype.otherwise = Promise.prototype.caught;
+Promise.prototype.exec = Promise.prototype.nodeify;
+
+Promise.resolve = Promise.fulfilled;
+Promise.reject  = Promise.rejected;
+
+exports.Promise = Promise;
+},{"bluebird/js/main/promise":35}],8:[function(require,module,exports){
+// Base Relation
+// ---------------
+
+var _        = require('lodash');
+var Backbone = require('backbone');
+
+var CollectionBase = require('./collection').CollectionBase;
+
+// Used internally, the `Relation` helps in simplifying the relationship building,
+// centralizing all logic dealing with type & option handling.
+var RelationBase = function(type, Target, options) {
+  this.type = type;
+  if (this.target = Target) {
+    this.targetTableName = _.result(Target.prototype, 'tableName');
+    this.targetIdAttribute = _.result(Target.prototype, 'idAttribute');
+  }
+  _.extend(this, options);
+};
+
+_.extend(RelationBase.prototype, {
+
+  // Creates a new relation instance, used by the `Eager` relation in
+  // dealing with `morphTo` cases, where the same relation is targeting multiple models.
+  instance: function(type, Target, options) {
+    return new this.constructor(type, Target, options);
+  },
+
+  // Creates a new, unparsed model, used internally in the eager fetch helper
+  // methods. (Parsing may mutate information necessary for eager pairing.)
+  createModel: function(data) {
+    if (this.target.prototype instanceof CollectionBase) {
+      return new this.target.prototype.model(data)._reset();
+    }
+    return new this.target(data)._reset();
+  },
+
+  // Eager pair the models.
+  eagerPair: function() {}
+
+});
+
+RelationBase.extend = Backbone.Model.extend;
+
+exports.RelationBase = RelationBase;
+
+},{"./collection":3,"backbone":15,"lodash":55}],9:[function(require,module,exports){
+// Collection
+// ---------------
+var _             = require('lodash');
+
+var Sync          = require('./sync').Sync;
+var Helpers       = require('./helpers').Helpers;
+var EagerRelation = require('./eager').EagerRelation;
+
+var CollectionBase = require('../base/collection').CollectionBase;
+var Promise        = require('../base/promise').Promise;
+
+exports.Collection = CollectionBase.extend({
+
+  // Used to define passthrough relationships - `hasOne`, `hasMany`,
+  // `belongsTo` or `belongsToMany`, "through" a `Interim` model or collection.
+  through: function(Interim, foreignKey, otherKey) {
+    return this.relatedData.through(this, Interim, {throughForeignKey: foreignKey, otherKey: otherKey});
+  },
+
+  // Fetch the models for this collection, resetting the models
+  // for the query when they arrive.
+  fetch: Promise.method(function(options) {
+    options = options ? _.clone(options) : {};
+    var sync = this.sync(options)
+      .select()
+      .bind(this)
+      .tap(function(response) {
+        if (!response || response.length === 0) {
+          if (options.require) throw new Error('EmptyResponse');
+          return Promise.reject(null);
+        }
+      })
+
+      // Now, load all of the data onto the collection as necessary.
+      .tap(handleResponse);
+
+    // If the "withRelated" is specified, we also need to eager load all of the
+    // data on the collection, as a side-effect, before we ultimately jump into the
+    // next step of the collection. Since the `columns` are only relevant to the current
+    // level, ensure those are omitted from the options.
+    if (options.withRelated) {
+      sync = sync.tap(handleEager(_.omit(options, 'columns')));
+    }
+
+    return sync.tap(function(response) {
+      return this.triggerThen('fetched', this, response, options);
+    })
+    .caught(function(err) {
+      if (err !== null) throw err;
+      this.reset([], {silent: true});
+    })
+    .yield(this);
+  }),
+
+  // Fetches a single model from the collection, useful on related collections.
+  fetchOne: Promise.method(function(options) {
+    var model = new this.model;
+    model._knex = this.query().clone();
+    if (this.relatedData) model.relatedData = this.relatedData;
+    return model.fetch(options);
+  }),
+
+  // Eager loads relationships onto an already populated `Collection` instance.
+  load: Promise.method(function(relations, options) {
+    _.isArray(relations) || (relations = [relations]);
+    options = _.extend({}, options, {shallow: true, withRelated: relations});
+    return new EagerRelation(this.models, this.toJSON(options), new this.model())
+      .fetch(options)
+      .yield(this);
+  }),
+
+  // Shortcut for creating a new model, saving, and adding to the collection.
+  // Returns a promise which will resolve with the model added to the collection.
+  // If the model is a relation, put the `foreignKey` and `fkValue` from the `relatedData`
+  // hash into the inserted model. Also, if the model is a `manyToMany` relation,
+  // automatically create the joining model upon insertion.
+  create: Promise.method(function(model, options) {
+    options = options ? _.clone(options) : {};
+    var relatedData = this.relatedData;
+    model = this._prepareModel(model, options);
+
+    // If we've already added things on the query chain,
+    // these are likely intended for the model.
+    if (this._knex) {
+      model._knex = this._knex;
+      this.resetQuery();
+    }
+
+    return Helpers
+      .saveConstraints(model, relatedData)
+      .save(null, options)
+      .bind(this)
+      .then(function() {
+        if (relatedData && (relatedData.type === 'belongsToMany' || relatedData.isThrough())) {
+          return this.attach(model, _.omit(options, 'query'));
+        }
+      })
+      .then(function() {
+        this.add(model, options);
+        return model;
+      });
+  }),
+
+  // Reset the query builder, called internally
+  // each time a query is run.
+  resetQuery: function() {
+    this._knex = null;
+    return this;
+  },
+
+  // Returns an instance of the query builder.
+  query: function() {
+    return Helpers.query(this, _.toArray(arguments));
+  },
+
+  // Creates and returns a new `Bookshelf.Sync` instance.
+  sync: function(options) {
+    return new Sync(this, options);
+  }
+
+});
+
+// Handles the response data for the collection, returning from the collection's fetch call.
+function handleResponse(response) {
+  var relatedData = this.relatedData;
+  this.set(response, {silent: true, parse: true}).invoke('_reset');
+  if (relatedData && relatedData.isJoined()) {
+    relatedData.parsePivot(this.models);
+  }
+}
+
+// Handle the related data loading on the collection.
+function handleEager(options) {
+  return function(response) {
+    return new EagerRelation(this.models, response, new this.model()).fetch(options);
+  };
+}
+},{"../base/collection":3,"../base/promise":7,"./eager":10,"./helpers":11,"./sync":14,"lodash":55}],10:[function(require,module,exports){
+// EagerRelation
+// ---------------
+var _         = require('lodash');
+
+var Helpers   = require('./helpers').Helpers;
+var EagerBase = require('../base/eager').EagerBase;
+var Promise   = require('../base/promise').Promise;
+
+// An `EagerRelation` object temporarily stores the models from an eager load,
+// and handles matching eager loaded objects with their parent(s). The `tempModel`
+// is only used to retrieve the value of the relation method, to know the constrains
+// for the eager query.
+var EagerRelation = exports.EagerRelation = EagerBase.extend({
+
+  // Handles an eager loaded fetch, passing the name of the item we're fetching for,
+  // and any options needed for the current fetch.
+  eagerFetch: Promise.method(function(relationName, handled, options) {
+    var relatedData = handled.relatedData;
+
+    // skip eager loading for rows where the foreign key isn't set
+    if (relatedData.parentFk === null) return;
+
+    if (relatedData.type === 'morphTo') return this.morphToFetch(relationName, relatedData, options);
+
+    // Call the function, if one exists, to constrain the eager loaded query.
+    options.beforeFn.call(handled, handled.query());
+    return handled
+      .sync(_.extend(options, {parentResponse: this.parentResponse}))
+      .select()
+      .tap(eagerLoadHelper(this, relationName, handled, _.omit(options, 'parentResponse')));
+  }),
+
+  // Special handler for the eager loaded morph-to relations, this handles
+  // the fact that there are several potential models that we need to be fetching against.
+  // pairing them up onto a single response for the eager loading.
+  morphToFetch: Promise.method(function(relationName, relatedData, options) {
+    var pending = [];
+    var groups = _.groupBy(this.parent, function(m) {
+      return m.get(relatedData.morphName + '_type');
+    });
+    for (var group in groups) {
+      var Target = Helpers.morphCandidate(relatedData.candidates, group);
+      var target = new Target();
+      pending.push(target
+        .query('whereIn',
+          _.result(target, 'idAttribute'),
+          _.uniq(_.invoke(groups[group], 'get', relatedData.morphName + '_id'))
+        )
+        .sync(options)
+        .select()
+        .tap(eagerLoadHelper(this, relationName, {
+          relatedData: relatedData.instance('morphTo', Target, {morphName: relatedData.morphName})
+        }, options)));
+    }
+    return Promise.all(pending).then(function(resps) {
+      return _.flatten(resps);
+    });
+  })
+
+});
+
+// Handles the eager load for both the `morphTo` and regular cases.
+function eagerLoadHelper(relation, relationName, handled, options) {
+  return function(resp) {
+    var relatedModels = relation.pushModels(relationName, handled, resp);
+    var relatedData   = handled.relatedData;
+
+    // If there is a response, fetch additional nested eager relations, if any.
+    if (resp.length > 0 && options.withRelated) {
+      var relatedModel = relatedData.createModel();
+
+      // If this is a `morphTo` relation, we need to do additional processing
+      // to ensure we don't try to load any relations that don't look to exist.
+      if (relatedData.type === 'morphTo') {
+        var withRelated = filterRelated(relatedModel, options);
+        if (withRelated.length === 0) return;
+        options = _.extend({}, options, {withRelated: withRelated});
+      }
+      return new EagerRelation(relatedModels, resp, relatedModel).fetch(options).yield(resp);
+    }
+  };
+}
+
+// Filters the `withRelated` on a `morphTo` relation, to ensure that only valid
+// relations are attempted for loading.
+function filterRelated(relatedModel, options) {
+
+  // By this point, all withRelated should be turned into a hash, so it should
+  // be fairly simple to process by splitting on the dots.
+  return _.reduce(options.withRelated, function(memo, val) {
+    for (var key in val) {
+      var seg = key.split('.')[0];
+      if (_.isFunction(relatedModel[seg])) memo.push(val);
+    }
+    return memo;
+  }, []);
+}
+
+},{"../base/eager":4,"../base/promise":7,"./helpers":11,"lodash":55}],11:[function(require,module,exports){
+// Helpers
+// ---------------
+
+var _ = require('lodash');
+
+exports.Helpers = {
+
+  // Sets the constraints necessary during a `model.save` call.
+  saveConstraints: function(model, relatedData) {
+    var data = {};
+    if (relatedData && relatedData.type && relatedData.type !== 'belongsToMany') {
+      data[relatedData.key('foreignKey')] = relatedData.parentFk || model.get(relatedData.key('foreignKey'));
+      if (relatedData.isMorph()) data[relatedData.key('morphKey')] = relatedData.key('morphValue');
+    }
+    return model.set(data);
+  },
+
+  // Finds the specific `morphTo` table we should be working with, or throws
+  // an error if none is matched.
+  morphCandidate: function(candidates, foreignTable) {
+    var Target = _.find(candidates, function(Candidate) {
+      return (_.result(Candidate.prototype, 'tableName') === foreignTable);
+    });
+    if (!Target) {
+      throw new Error('The target polymorphic model was not found');
+    }
+    return Target;
+  },
+
+  // If there are no arguments, return the current object's
+  // query builder (or create and return a new one). If there are arguments,
+  // call the query builder with the first argument, applying the rest.
+  // If the first argument is an object, assume the keys are query builder
+  // methods, and the values are the arguments for the query.
+  query: function(obj, args) {
+    obj._knex = obj._knex || obj._builder(_.result(obj, 'tableName'));
+    if (args.length === 0) return obj._knex;
+    var method = args[0];
+    if (_.isFunction(method)) {
+      method.call(obj._knex, obj._knex);
+    } else if (_.isObject(method)) {
+      for (var key in method) {
+        var target = _.isArray(method[key]) ?  method[key] : [method[key]];
+        obj._knex[key].apply(obj._knex, target);
+      }
+    } else {
+      obj._knex[method].apply(obj._knex, args.slice(1));
+    }
+    return obj;
+  }
+
+};
+
+},{"lodash":55}],12:[function(require,module,exports){
+// Model
+// ---------------
+var _             = require('lodash');
+
+var Sync          = require('./sync').Sync;
+var Helpers       = require('./helpers').Helpers;
+var EagerRelation = require('./eager').EagerRelation;
+
+var ModelBase = require('../base/model').ModelBase;
+var Promise   = require('../base/promise').Promise;
+
+exports.Model = ModelBase.extend({
+
+  // The `hasOne` relation specifies that this table has exactly one of another type of object,
+  // specified by a foreign key in the other table. The foreign key is assumed to be the singular of this
+  // object's `tableName` with an `_id` suffix, but a custom `foreignKey` attribute may also be specified.
+  hasOne: function(Target, foreignKey) {
+    return this._relation('hasOne', Target, {foreignKey: foreignKey}).init(this);
+  },
+
+  // The `hasMany` relation specifies that this object has one or more rows in another table which
+  // match on this object's primary key. The foreign key is assumed to be the singular of this object's
+  // `tableName` with an `_id` suffix, but a custom `foreignKey` attribute may also be specified.
+  hasMany: function(Target, foreignKey) {
+    return this._relation('hasMany', Target, {foreignKey: foreignKey}).init(this);
+  },
+
+  // A reverse `hasOne` relation, the `belongsTo`, where the specified key in this table
+  // matches the primary `idAttribute` of another table.
+  belongsTo: function(Target, foreignKey) {
+    return this._relation('belongsTo', Target, {foreignKey: foreignKey}).init(this);
+  },
+
+  // A `belongsToMany` relation is when there are many-to-many relation
+  // between two models, with a joining table.
+  belongsToMany: function(Target, joinTableName, foreignKey, otherKey) {
+    return this._relation('belongsToMany', Target, {
+      joinTableName: joinTableName, foreignKey: foreignKey, otherKey: otherKey
+    }).init(this);
+  },
+
+  // A `morphOne` relation is a one-to-one polymorphic association from this model
+  // to another model.
+  morphOne: function(Target, name, morphValue) {
+    return this._morphOneOrMany(Target, name, morphValue, 'morphOne');
+  },
+
+  // A `morphMany` relation is a polymorphic many-to-one relation from this model
+  // to many another models.
+  morphMany: function(Target, name, morphValue) {
+    return this._morphOneOrMany(Target, name, morphValue, 'morphMany');
+  },
+
+  // Defines the opposite end of a `morphOne` or `morphMany` relationship, where
+  // the alternate end of the polymorphic model is defined.
+  morphTo: function(morphName) {
+    if (!_.isString(morphName)) throw new Error('The `morphTo` name must be specified.');
+    return this._relation('morphTo', null, {morphName: morphName, candidates: _.rest(arguments)}).init(this);
+  },
+
+  // Used to define passthrough relationships - `hasOne`, `hasMany`,
+  // `belongsTo` or `belongsToMany`, "through" a `Interim` model or collection.
+  through: function(Interim, foreignKey, otherKey) {
+    return this.relatedData.through(this, Interim, {throughForeignKey: foreignKey, otherKey: otherKey});
+  },
+
+  // Fetch a model based on the currently set attributes,
+  // returning a model to the callback, along with any options.
+  // Returns a deferred promise through the `Bookshelf.Sync`.
+  // If `{require: true}` is set as an option, the fetch is considered
+  // a failure if the model comes up blank.
+  fetch: Promise.method(function(options) {
+    options = options ? _.clone(options) : {};
+
+    // Run the `first` call on the `sync` object to fetch a single model.
+    var sync = this.sync(options)
+      .first()
+      .bind(this)
+
+      // Jump the rest of the chain if the response doesn't exist...
+      .tap(function(response) {
+        if (!response || response.length === 0) {
+          if (options.require) throw new Error('EmptyResponse');
+          return Promise.reject(null);
+        }
+      })
+
+      // Now, load all of the data into the model as necessary.
+      .tap(handleResponse);
+
+    // If the "withRelated" is specified, we also need to eager load all of the
+    // data on the model, as a side-effect, before we ultimately jump into the
+    // next step of the model. Since the `columns` are only relevant to the current
+    // level, ensure those are omitted from the options.
+    if (options.withRelated) {
+      sync = sync.tap(handleEager(_.omit(options, 'columns')));
+    }
+
+    return sync.tap(function(response) {
+      return this.triggerThen('fetched', this, response, options);
+    })
+    .yield(this)
+    .caught(function(err) {
+      if (err === null) return err;
+      throw err;
     });
 
-    // If the builder came with a supplied connection, then we won't do
-    // anything to it (most commonly in the case of transactions)... otherwise,
-    // ensure the connection gets dumped back into the client pool.
-    if (!builder.usingConnection) {
-      chain = chain.ensure(function() {
-        if (!conn) {
-          // The connection must have failed to initialize. Avoid pushing undefined
-          // into the connection pool.
-          return;
+  }),
+
+  // Eager loads relationships onto an already populated `Model` instance.
+  load: Promise.method(function(relations, options) {
+    return Promise.bind(this)
+      .then(function() {
+        return [this.toJSON({shallow: true})];
+      })
+      .then(handleEager(_.extend({}, options, {
+        shallow: true,
+        withRelated: _.isArray(relations) ? relations : [relations]
+      }))).yield(this);
+  }),
+
+  // Sets and saves the hash of model attributes, triggering
+  // a "creating" or "updating" event on the model, as well as a "saving" event,
+  // to bind listeners for any necessary validation, logging, etc.
+  // If an error is thrown during these events, the model will not be saved.
+  save: Promise.method(function(key, val, options) {
+    var attrs;
+
+    // Handle both `"key", value` and `{key: value}` -style arguments.
+    if (key == null || typeof key === "object") {
+      attrs = key || {};
+      options = _.clone(val) || {};
+    } else {
+      (attrs = {})[key] = val;
+      options = options ? _.clone(options) : {};
+    }
+
+    return Promise.bind(this).then(function() {
+      return this.isNew(options);
+    }).then(function(isNew) {
+
+      // If the model has timestamp columns,
+      // set them as attributes on the model, even
+      // if the "patch" option is specified.
+      if (this.hasTimestamps) _.extend(attrs, this.timestamp(options));
+
+      // Determine whether the model is new, based on whether the model has an `idAttribute` or not.
+      options.method = (options.method || (isNew ? 'insert' : 'update')).toLowerCase();
+      var method = options.method;
+      var vals = attrs;
+
+      // If the object is being created, we merge any defaults here
+      // rather than during object creation.
+      if (method === 'insert' || options.defaults) {
+        var defaults = _.result(this, 'defaults');
+        if (defaults) {
+          vals = _.extend({}, defaults, this.attributes, vals);
         }
-        client.pool.release(conn);
+      }
+
+      // Set the attributes on the model.
+      this.set(vals, {silent: true});
+
+      // If there are any save constraints, set them on the model.
+      if (this.relatedData && this.relatedData.type !== 'morphTo') {
+        Helpers.saveConstraints(this, this.relatedData);
+      }
+
+      // Gives access to the `query` object in the `options`, in case we need it
+      // in any event handlers.
+      var sync = this.sync(options);
+      options.query = sync.query;
+
+      return Promise.all([
+        this.triggerThen((method === 'insert' ? 'creating' : 'updating'), this, attrs, options),
+        this.triggerThen('saving', this, attrs, options)
+      ])
+      .bind(this)
+      .then(function() {
+        return sync[options.method](method === 'update' && options.patch ? attrs : this.attributes);
+      })
+      .then(function(resp) {
+
+        // After a successful database save, the id is updated if the model was created
+        if (method === 'insert' && this.id == null) {
+          this.attributes[this.idAttribute] = this.id = resp[0];
+        } else if (method === 'update' && resp === 0) {
+          throw new Error('No rows were affected in the update, did you mean to pass the {method: "insert"} option?');
+        }
+
+        // In case we need to reference the `previousAttributes` for the this
+        // in the following event handlers.
+        options.previousAttributes = this._previousAttributes;
+
+        this._reset();
+
+        return Promise.all([
+          this.triggerThen((method === 'insert' ? 'created' : 'updated'), this, resp, options),
+          this.triggerThen('saved', this, resp, options)
+        ]);
+
+      });
+
+    }).yield(this);
+  }),
+
+  // Reset the query builder, called internally
+  // each time a query is run.
+  resetQuery: function() {
+    this._knex = null;
+    return this;
+  },
+
+  // Returns an instance of the query builder.
+  query: function() {
+    return Helpers.query(this, _.toArray(arguments));
+  },
+
+  // Creates and returns a new `Sync` instance.
+  sync: function(options) {
+    return new Sync(this, options);
+  },
+
+  // Helper for setting up the `morphOne` or `morphMany` relations.
+  _morphOneOrMany: function(Target, morphName, morphValue, type) {
+    if (!morphName || !Target) throw new Error('The polymorphic `name` and `Target` are required.');
+    return this._relation(type, Target, {morphName: morphName, morphValue: morphValue}).init(this);
+  }
+
+});
+
+// Handles the response data for the model, returning from the model's fetch call.
+// Todo: {silent: true, parse: true}, for parity with collection#set
+// need to check on Backbone's status there, ticket #2636
+function handleResponse(response) {
+  var relatedData = this.relatedData;
+  this.set(this.parse(response[0]), {silent: true})._reset();
+  if (relatedData && relatedData.isJoined()) {
+    relatedData.parsePivot([this]);
+  }
+}
+
+// Handle the related data loading on the model.
+function handleEager(options) {
+  return function(response) {
+    return new EagerRelation([this], response, this).fetch(options);
+  };
+}
+
+},{"../base/model":6,"../base/promise":7,"./eager":10,"./helpers":11,"./sync":14,"lodash":55}],13:[function(require,module,exports){
+// Relation
+// ---------------
+var _            = require('lodash');
+
+var Helpers      = require('./helpers').Helpers;
+
+var ModelBase    = require('../base/model').ModelBase;
+var RelationBase = require('../base/relation').RelationBase;
+var Promise      = require('../base/promise').Promise;
+
+var push = [].push;
+
+exports.Relation = RelationBase.extend({
+
+  // Assembles the new model or collection we're creating an instance of,
+  // gathering any relevant primitives from the parent object,
+  // without keeping any hard references.
+  init: function(parent) {
+    this.parentId          = parent.id;
+    this.parentTableName   = _.result(parent, 'tableName');
+    this.parentIdAttribute = _.result(parent, 'idAttribute');
+
+    if (this.isInverse()) {
+      // If the parent object is eager loading, and it's a polymorphic `morphTo` relation,
+      // we can't know what the target will be until the models are sorted and matched.
+      if (this.type === 'morphTo' && !parent._isEager) {
+        this.target = Helpers.morphCandidate(this.candidates, parent.get(this.key('morphKey')));
+        this.targetTableName   = _.result(this.target.prototype, 'tableName');
+        this.targetIdAttribute = _.result(this.target.prototype, 'idAttribute');
+      }
+      this.parentFk = parent.get(this.key('foreignKey'));
+    } else {
+      this.parentFk = parent.id;
+    }
+
+    var target = this.target ? this.relatedInstance() : {};
+        target.relatedData = this;
+
+    if (this.type === 'belongsToMany') {
+      _.extend(target, pivotHelpers);
+    }
+
+    return target;
+  },
+
+  // Initializes a `through` relation, setting the `Target` model and `options`,
+  // which includes any additional keys for the relation.
+  through: function(source, Target, options) {
+    var type = this.type;
+    if (type !== 'hasOne' && type !== 'hasMany' && type !== 'belongsToMany' && type !== 'belongsTo') {
+      throw new Error('`through` is only chainable from `hasOne`, `belongsTo`, `hasMany`, or `belongsToMany`');
+    }
+
+    this.throughTarget = Target;
+    this.throughTableName = _.result(Target.prototype, 'tableName');
+    this.throughIdAttribute = _.result(Target.prototype, 'idAttribute');
+
+    // Set the parentFk as appropriate now.
+    if (this.type === 'belongsTo') {
+      this.parentFk = this.parentId;
+    }
+
+    _.extend(this, options);
+    _.extend(source, pivotHelpers);
+
+    // Set the appropriate foreign key if we're doing a belongsToMany, for convenience.
+    if (this.type === 'belongsToMany') {
+      this.foreignKey = this.throughForeignKey;
+    }
+
+    return source;
+  },
+
+  // Generates and returns a specified key, for convenience... one of
+  // `foreignKey`, `otherKey`, `throughForeignKey`.
+  key: function(keyName) {
+    if (this[keyName]) return this[keyName];
+    if (keyName === 'otherKey') {
+      return this[keyName] = singularMemo(this.targetTableName) + '_' + this.targetIdAttribute;
+    }
+    if (keyName === 'throughForeignKey') {
+      return this[keyName] = singularMemo(this.joinTable()) + '_' + this.throughIdAttribute;
+    }
+    if (keyName === 'foreignKey') {
+      if (this.type === 'morphTo') return this[keyName] = this.morphName + '_id';
+      if (this.type === 'belongsTo') return this[keyName] = singularMemo(this.targetTableName) + '_' + this.targetIdAttribute;
+      if (this.isMorph()) return this[keyName] = this.morphName + '_id';
+      return this[keyName] = singularMemo(this.parentTableName) + '_' + this.parentIdAttribute;
+    }
+    if (keyName === 'morphKey') return this[keyName] = this.morphName + '_type';
+    if (keyName === 'morphValue') return this[keyName] = this.parentTableName || this.targetTableName;
+  },
+
+  // Injects the necessary `select` constraints into a `knex` query builder.
+  selectConstraints: function(knex, options) {
+    var resp = options.parentResponse;
+
+    // The base select column
+    if (knex.columns.length === 0 && (!options.columns || options.columns.length === 0)) {
+      knex.columns.push(this.targetTableName + '.*');
+    } else if (_.isArray(options.columns) && options.columns.length > 0) {
+      push.apply(knex.columns, options.columns);
+    }
+
+    // The `belongsToMany` and `through` relations have joins & pivot columns.
+    if (this.isJoined()) {
+      this.joinClauses(knex);
+      this.joinColumns(knex);
+    }
+
+    // If this is a single relation and we're not eager loading,
+    // limit the query to a single item.
+    if (this.isSingle() && !resp) knex.limit(1);
+
+    // Finally, add (and validate) the where conditions, necessary for constraining the relation.
+    this.whereClauses(knex, resp);
+  },
+
+  // Inject & validates necessary `through` constraints for the current model.
+  joinColumns: function(knex) {
+    var columns = [];
+    var joinTable = this.joinTable();
+    if (this.isThrough()) columns.push(this.throughIdAttribute);
+    columns.push(this.key('foreignKey'));
+    if (this.type === 'belongsToMany') columns.push(this.key('otherKey'));
+    push.apply(columns, this.pivotColumns);
+    push.apply(knex.columns, _.map(columns, function(col) {
+      return joinTable + '.' + col + ' as _pivot_' + col;
+    }));
+  },
+
+  // Generates the join clauses necessary for the current relation.
+  joinClauses: function(knex) {
+    var joinTable = this.joinTable();
+
+    if (this.type === 'belongsTo' || this.type === 'belongsToMany') {
+
+      var targetKey = (this.type === 'belongsTo' ? this.key('foreignKey') : this.key('otherKey'));
+
+      knex.join(
+        joinTable,
+        joinTable + '.' + targetKey, '=',
+        this.targetTableName + '.' + this.targetIdAttribute
+      );
+
+      // A `belongsTo` -> `through` is currently the only relation with two joins.
+      if (this.type === 'belongsTo') {
+        knex.join(
+          this.parentTableName,
+          joinTable + '.' + this.throughIdAttribute, '=',
+          this.parentTableName + '.' + this.key('throughForeignKey')
+        );
+      }
+
+    } else {
+      knex.join(
+        joinTable,
+        joinTable + '.' + this.throughIdAttribute, '=',
+        this.targetTableName + '.' + this.key('throughForeignKey')
+      );
+    }
+  },
+
+  // Check that there isn't an incorrect foreign key set, vs. the one
+  // passed in when the relation was formed.
+  whereClauses: function(knex, resp) {
+    var key;
+
+    if (this.isJoined()) {
+      var targetTable = this.type === 'belongsTo' ? this.parentTableName : this.joinTable();
+      key = targetTable + '.' + (this.type === 'belongsTo' ? this.parentIdAttribute : this.key('foreignKey'));
+    } else {
+      key = this.targetTableName + '.' +
+        (this.isInverse() ? this.targetIdAttribute : this.key('foreignKey'));
+    }
+
+    knex[resp ? 'whereIn' : 'where'](key, resp ? this.eagerKeys(resp) : this.parentFk);
+
+    if (this.isMorph()) {
+      knex.where(this.targetTableName + '.' + this.key('morphKey'), this.key('morphValue'));
+    }
+  },
+
+  // Fetches all `eagerKeys` from the current relation.
+  eagerKeys: function(resp) {
+    var key = this.isInverse() && !this.isThrough() ? this.key('foreignKey') : this.parentIdAttribute;
+    return _.uniq(_.pluck(resp, key));
+  },
+
+  // Generates the appropriate standard join table.
+  joinTable: function() {
+    if (this.isThrough()) return this.throughTableName;
+    return this.joinTableName || [
+      this.parentTableName,
+      this.targetTableName
+    ].sort().join('_');
+  },
+
+  // Creates a new model or collection instance, depending on
+  // the `relatedData` settings and the models passed in.
+  relatedInstance: function(models) {
+    models || (models = []);
+
+    var Target = this.target;
+
+    // If it's a single model, check whether there's already a model
+    // we can pick from... otherwise create a new instance.
+    if (this.isSingle()) {
+      if (!(Target.prototype instanceof ModelBase)) {
+        throw new Error('The `'+this.type+'` related object must be a Bookshelf.Model');
+      }
+      return models[0] || new Target();
+    }
+
+    // Allows us to just use a model, but create a temporary
+    // collection for a "*-many" relation.
+    if (Target.prototype instanceof ModelBase) {
+      Target = this.Collection.extend({
+        model: Target,
+        _builder: Target.prototype._builder
+      });
+    }
+    return new Target(models, {parse: true});
+  },
+
+  // Groups the related response according to the type of relationship
+  // we're handling, for easy attachment to the parent models.
+  eagerPair: function(relationName, related, parentModels) {
+    var model;
+
+    // If this is a morphTo, we only want to pair on the morphValue for the current relation.
+    if (this.type === 'morphTo') {
+      parentModels = _.filter(parentModels, function(model) {
+        return model.get(this.key('morphKey')) === this.key('morphValue');
+      }, this);
+    }
+
+    // If this is a `through` or `belongsToMany` relation, we need to cleanup & setup the `interim` model.
+    if (this.isJoined()) related = this.parsePivot(related);
+
+    // Group all of the related models for easier association with their parent models.
+    var grouped = _.groupBy(related, function(model) {
+      if (model.pivot) {
+        return this.isInverse() && this.isThrough() ? model.pivot.id :
+          model.pivot.get(this.key('foreignKey'));
+      } else {
+        return this.isInverse() ? model.id : model.get(this.key('foreignKey'));
+      }
+    }, this);
+
+    // Loop over the `parentModels` and attach the grouped sub-models,
+    // keeping the `relatedData` on the new related instance.
+    for (var i = 0, l = parentModels.length; i < l; i++) {
+      model = parentModels[i];
+      var groupedKey = !this.isInverse() ? model.id :
+            this.isThrough() ? model.get(this.key('throughForeignKey')) :
+            model.get(this.key('foreignKey'));
+      var relation = model.relations[relationName] = this.relatedInstance(grouped[groupedKey]);
+      relation.relatedData = this;
+      if (this.isJoined()) _.extend(relation, pivotHelpers);
+    }
+
+    // Now that related models have been successfully paired, update each with
+    // its parsed attributes
+    for (i = 0, l = related.length; i < l; i++) {
+      model = related[i];
+      model.attributes = model.parse(model.attributes);
+    }
+
+    return related;
+  },
+
+  // The `models` is an array of models returned from the fetch,
+  // after they're `set`... parsing out any of the `_pivot_` items from the
+  // join table and assigning them on the pivot model or object as appropriate.
+  parsePivot: function(models) {
+    var Through = this.throughTarget;
+    return _.map(models, function(model) {
+      var data = {}, keep = {}, attrs = model.attributes, through;
+      if (Through) through = new Through();
+      for (var key in attrs) {
+        if (key.indexOf('_pivot_') === 0) {
+          data[key.slice(7)] = attrs[key];
+        } else {
+          keep[key] = attrs[key];
+        }
+      }
+      model.attributes = keep;
+      if (!_.isEmpty(data)) {
+        model.pivot = through ? through.set(data, {silent: true}) : new this.Model(data, {
+          tableName: this.joinTable()
+        });
+      }
+      return model;
+    }, this);
+  },
+
+  // A few predicates to help clarify some of the logic above.
+  isThrough: function() {
+    return (this.throughTarget != null);
+  },
+  isJoined: function() {
+    return (this.type === 'belongsToMany' || this.isThrough());
+  },
+  isMorph: function() {
+    return (this.type === 'morphOne' || this.type === 'morphMany');
+  },
+  isSingle: function() {
+    var type = this.type;
+    return (type === 'hasOne' || type === 'belongsTo' || type === 'morphOne' || type === 'morphTo');
+  },
+  isInverse: function() {
+    return (this.type === 'belongsTo' || this.type === 'morphTo');
+  },
+
+  // Sets the `pivotColumns` to be retrieved along with the current model.
+  withPivot: function(columns) {
+    if (!_.isArray(columns)) columns = [columns];
+    this.pivotColumns || (this.pivotColumns = []);
+    push.apply(this.pivotColumns, columns);
+  }
+
+});
+
+// Simple memoization of the singularize call.
+var singularMemo = (function() {
+  var cache = Object.create(null);
+  return function(arg) {
+    if (arg in cache) {
+      return cache[arg];
+    } else {
+      return cache[arg] = inflection.singularize(arg);
+    }
+  };
+}());
+
+// Specific to many-to-many relationships, these methods are mixed
+// into the `belongsToMany` relationships when they are created,
+// providing helpers for attaching and detaching related models.
+var pivotHelpers = {
+
+  // Attach one or more "ids" from a foreign
+  // table to the current. Creates & saves a new model
+  // and attaches the model with a join table entry.
+  attach: function(ids, options) {
+    return this._handler('insert', ids, options);
+  },
+
+  // Detach related object from their pivot tables.
+  // If a model or id is passed, it attempts to remove the
+  // pivot table based on that foreign key. If a hash is passed,
+  // it attempts to remove the item based on a where clause with
+  // these parameters. If no parameters are specified, we assume we will
+  // detach all related associations.
+  detach: function(ids, options) {
+    return this._handler('delete', ids, options);
+  },
+
+  // Update an existing relation's pivot table entry.
+  updatePivot: function(data, options) {
+    return this._handler('update', data, options);
+  },
+
+  // Selects any additional columns on the pivot table,
+  // taking a hash of columns which specifies the pivot
+  // column name, and the value the column should take on the
+  // output to the model attributes.
+  withPivot: function(columns) {
+    this.relatedData.withPivot(columns);
+    return this;
+  },
+
+  // Helper for handling either the `attach` or `detach` call on
+  // the `belongsToMany` or `hasOne` / `hasMany` :through relationship.
+  _handler: Promise.method(function(method, ids, options) {
+    var pending = [];
+    if (ids == void 0) {
+      if (method === 'insert') return Promise.resolve(this);
+      if (method === 'delete') pending.push(this._processPivot(method, null, options));
+    }
+    if (!_.isArray(ids)) ids = ids ? [ids] : [];
+    for (var i = 0, l = ids.length; i < l; i++) {
+      pending.push(this._processPivot(method, ids[i], options));
+    }
+    return Promise.all(pending).yield(this);
+  }),
+
+  // Handles setting the appropriate constraints and shelling out
+  // to either the `insert` or `delete` call for the current model,
+  // returning a promise.
+  _processPivot: Promise.method(function(method, item, options) {
+    var data = {};
+    var relatedData = this.relatedData;
+
+    // Grab the `knex` query builder for the current model, and
+    // check if we have any additional constraints for the query.
+    var builder = this._builder(relatedData.joinTable());
+    if (options && options.query) {
+      Helpers.query.call(null, {_knex: builder}, [options.query]);
+    }
+
+    data[relatedData.key('foreignKey')] = relatedData.parentFk;
+
+    // If the item is an object, it's either a model
+    // that we're looking to attach to this model, or
+    // a hash of attributes to set in the relation.
+    if (_.isObject(item)) {
+      if (item instanceof ModelBase) {
+        data[relatedData.key('otherKey')] = item.id;
+      } else if (method !== 'update') {
+        _.extend(data, item);
+      }
+    } else if (item) {
+      data[relatedData.key('otherKey')] = item;
+    }
+
+    if (options) {
+      if (options.transacting) builder.transacting(options.transacting);
+      if (options.debug) builder.debug();
+    }
+    var collection = this;
+    if (method === 'delete') {
+      return builder.where(data).del().then(function() {
+        var model;
+        if (!item) return collection.reset();
+        if (model = collection.get(data[relatedData.key('otherKey')])) {
+          collection.remove(model);
+        }
+      });
+    }
+    if (method === 'update') {
+      return builder.where(data).update(item).then(function (numUpdated) {
+        if (options && options.require === true && numUpdated === 0) {
+          throw new Error('No rows were updated');
+        }
+        return numUpdated;
       });
     }
 
-    // Since we usually only need the `sql` and `bindings` to help us debug the query, output them
-    // into a new error... this way, it `console.log`'s nicely for debugging, but you can also
-    // parse them out with a `JSON.parse(error.message)`. Also, use the original `clientError` from the
-    // database client is retained as a property on the `newError`, for any additional info.
-    return chain.then(builder.handleResponse).caught(function(error) {
-      var newError = new Error(error.message + ', sql: ' + sql + ', bindings: ' + bindings);
-          newError.sql = sql;
-          newError.bindings = bindings;
-          newError.clientError = error;
-      throw newError;
+    return builder.insert(data).then(function() {
+      collection.add(item);
+    });
+  })
+
+};
+
+},{"../base/model":6,"../base/promise":7,"../base/relation":8,"./helpers":11,"lodash":55}],14:[function(require,module,exports){
+// Sync
+// ---------------
+var _       = require('lodash');
+var Promise = require('../base/promise').Promise;
+
+// Sync is the dispatcher for any database queries,
+// taking the "syncing" `model` or `collection` being queried, along with
+// a hash of options that are used in the various query methods.
+// If the `transacting` option is set, the query is assumed to be
+// part of a transaction, and this information is passed along to `Knex`.
+var Sync = function(syncing, options) {
+  options || (options = {});
+  this.query   = syncing.query();
+  this.syncing = syncing.resetQuery();
+  this.options = options;
+  if (options.debug) this.query.debug();
+  if (options.transacting) this.query.transacting(options.transacting);
+};
+
+_.extend(Sync.prototype, {
+
+  // Prefix all keys of the passed in object with the
+  // current table name
+  prefixFields: function (fields) {
+    var tableName = this.syncing.tableName;
+    var prefixed = {};
+    for (var key in fields) {
+      prefixed[tableName + '.' + key] = fields[key];
+    }
+    return prefixed;
+  },
+
+
+  // Select the first item from the database - only used by models.
+  first: Promise.method(function() {
+    this.query.where(this.syncing.format(
+      _.extend(Object.create(null), this.prefixFields(this.syncing.attributes)))
+    ).limit(1);
+    return this.select();
+  }),
+
+  // Runs a `select` query on the database, adding any necessary relational
+  // constraints, resetting the query when complete. If there are results and
+  // eager loaded relations, those are fetched and returned on the model before
+  // the promise is resolved. Any `success` handler passed in the
+  // options will be called - used by both models & collections.
+  select: Promise.method(function() {
+    var columns, sync = this,
+      options = this.options, relatedData = this.syncing.relatedData;
+
+    // Inject all appropriate select costraints dealing with the relation
+    // into the `knex` query builder for the current instance.
+    if (relatedData) {
+      relatedData.selectConstraints(this.query, options);
+    } else {
+      columns = options.columns;
+      if (!_.isArray(columns)) columns = columns ? [columns] : [_.result(this.syncing, 'tableName') + '.*'];
+    }
+
+    // Set the query builder on the options, in-case we need to
+    // access in the `fetching` event handlers.
+    options.query = this.query;
+
+    // Trigger a `fetching` event on the model, and then select the appropriate columns.
+    return Promise.bind(this).then(function() {
+      return this.syncing.triggerThen('fetching', this.syncing, columns, options);
+    }).then(function() {
+      return this.query.select(columns);
     });
   }),
 
-  // Debug a query.
-  debug: function(sql, bindings, connection, builder) {
-    console.log({sql: sql, bindings: bindings, __cid: connection.__cid});
-  },
+  // Issues an `insert` command on the query - only used by models.
+  insert: Promise.method(function() {
+    var syncing = this.syncing;
+    return this.query
+      .insert(syncing.format(_.extend(Object.create(null), syncing.attributes)), syncing.idAttribute);
+  }),
 
-  // Retrieves a connection from the connection pool,
-  // returning a promise.
-  getConnection: function(builder) {
-    if (builder && builder.usingConnection) return Promise.fulfilled(builder.usingConnection);
-    return Promise.promisify(this.pool.acquire, this.pool)();
-  },
+  // Issues an `update` command on the query - only used by models.
+  update: Promise.method(function(attrs) {
+    var syncing = this.syncing, query = this.query;
+    if (syncing.id != null) query.where(syncing.idAttribute, syncing.id);
+    if (query.wheres.length === 0) {
+      throw new Error('A model cannot be updated without a "where" clause or an idAttribute.');
+    }
+    return query.update(syncing.format(_.extend(Object.create(null), attrs)));
+  }),
 
-  // Releases a connection from the connection pool,
-  // returning a promise.
-  releaseConnection: function(conn) {
-    return Promise.promisify(this.pool.release)(conn);
-  },
-
-  // Begins a transaction statement on the instance,
-  // resolving with the connection of the current transaction.
-  startTransaction: function() {
-    return this.getConnection()
-      .tap(function(connection) {
-        return Promise.promisify(connection.query, connection)('begin;', []);
-      });
-  },
-
-  // Finishes the transaction statement on the instance.
-  finishTransaction: function(type, transaction, msg) {
-    var client = this;
-    var dfd    = transaction.dfd;
-    Promise.promisify(transaction.connection.query, transaction.connection)(type + ';', []).then(function(resp) {
-      if (type === 'commit') dfd.fulfill(msg || resp);
-      if (type === 'rollback') dfd.reject(msg || resp);
-    }, function (err) {
-      dfd.reject(err);
-    }).ensure(function() {
-      return client.releaseConnection(transaction.connection).tap(function() {
-        transaction.connection = null;
-      });
-    });
-  }
+  // Issues a `delete` command on the query.
+  del: Promise.method(function() {
+    var query = this.query, syncing = this.syncing;
+    if (syncing.id != null) query.where(syncing.idAttribute, syncing.id);
+    if (query.wheres.length === 0) {
+      throw new Error('A model cannot be destroyed without a "where" clause or an idAttribute.');
+    }
+    return this.query.del();
+  })
 
 });
 
-exports.ServerBase = ServerBase;
+exports.Sync = Sync;
 
-},{"../../lib/promise":17,"../base":1,"../pool":6,"lodash":62}],8:[function(require,module,exports){
-// SQLite3
-// -------
+},{"../base/promise":7,"lodash":55}],15:[function(require,module,exports){
+//     Backbone.js 1.1.0
 
-// Other dependencies, including the `sqlite3` library,
-// which needs to be added as a dependency to the project
-// using this database.
-var _       = require('lodash');
+//     (c) 2010-2011 Jeremy Ashkenas, DocumentCloud Inc.
+//     (c) 2011-2013 Jeremy Ashkenas, DocumentCloud and Investigative Reporters & Editors
+//     Backbone may be freely distributed under the MIT license.
+//     For all details and documentation:
+//     http://backbonejs.org
 
-// All other local project modules needed in this scope.
-var ServerBase      = require('./base').ServerBase;
-var Builder         = require('../../lib/builder').Builder;
-var Transaction     = require('../../lib/transaction').Transaction;
-var SchemaInterface = require('../../lib/schemainterface').SchemaInterface;
-var Helpers         = require('../../lib/helpers').Helpers;
-var Promise         = require('../../lib/promise').Promise;
+(function(){
 
-var grammar         = require('./sqlite3/grammar').grammar;
-var schemaGrammar   = require('./sqlite3/schemagrammar').schemaGrammar;
+  // Initial Setup
+  // -------------
 
-// Constructor for the RestClient.
-var RestClient = exports.Client = ServerBase.extend({
+  // Save a reference to the global object (`window` in the browser, `exports`
+  // on the server).
+  var root = this;
 
-  dialect: 'sqlite3',
+  // Save the previous value of the `Backbone` variable, so that it can be
+  // restored later on, if `noConflict` is used.
+  var previousBackbone = root.Backbone;
 
-  // Attach the appropriate grammar definitions onto the current client.
-  attachGrammars: function() {
-    this.grammar = grammar;
-    this.schemaGrammar = schemaGrammar;
-  },
+  // Create local references to array methods we'll want to use later.
+  var array = [];
+  var push = array.push;
+  var slice = array.slice;
+  var splice = array.splice;
 
-  // Runs the query on the specified connection, providing the bindings
-  // and any other necessary prep work.
-  runQuery: function(connection, sql, bindings, builder) {
-
-    if (typeof this.connectionSettings.url === 'undefined') throw new Error('No endpoint exists for the query');
-    var method = (builder.type === 'insert' || builder.type === 'update' || builder.type === 'delete') ? 'run' : 'all';
-
-    var dfd = Promise.pending();
-    $.post(this.connectionSettings.url, {sql: sql, bindings: bindings}, function(result){
-      return dfd.fulfill([result, this]);
-    }, 'json');
-    return dfd.promise;
-  },
-
-  poolDefaults: {
-    max: 1,
-    min: 1,
-    destroy: function(client){}
-  },
-
-  ddl: function(connection, sql, bindings, builder) {
-    var client = this;
-  },
-
-  getRawConnection: function() {
-    var dfd = Promise.pending();
-    dfd.fulfill({});
-    return dfd.promise;
-  },
-
-  close: function() {
-    console.log('try to close');
-  },
-
-  // Used to explicitly close a connection, called internally by the pool
-  // when a connection times out or the pool is shutdown.
-  destroyRawConnection: function(connection) {
-    console.log('try to destroy');
-  },
-
-  // Begins a transaction statement on the instance,
-  // resolving with the connection of the current transaction.
-  startTransaction: function(connection) {
-    console.log('try to startTransaction');
-  },
-
-  // Finishes the transaction statement on the instance.
-  finishTransaction: function(type, transaction, msg) {
-    var client = this;
-    var dfd    = transaction.dfd;
-
-    console.log('try to finishTransaction');
-  },
-
-  // This needs to be refactored... badly.
-  alterSchema: function(builder, trx) {
-    var currentCol, command;
-    console.log('try to alterSchema');
-  }
-
-});
-
-},{"../../lib/builder":13,"../../lib/helpers":16,"../../lib/promise":17,"../../lib/schemainterface":20,"../../lib/transaction":22,"./base":7,"./sqlite3/grammar":9,"./sqlite3/schemagrammar":10,"lodash":62}],9:[function(require,module,exports){
-// SQLite3 Grammar
-// -------
-var _           = require('lodash');
-var Helpers     = require('../../../lib/helpers').Helpers;
-var baseGrammar = require('../../base/sqlite3/grammar').grammar;
-
-// Extends the base SQLite3 grammar, adding only the functions
-// specific to the server.
-exports.grammar = _.defaults({
-
-  // Ensures the response is returned in the same format as other clients.
-  handleResponse: function(builder, resp) {
-    var ctx = resp[1]; resp = resp[0];
-    if (builder.type === 'select') {
-      resp = Helpers.skim(resp);
-    } else if (builder.type === 'insert') {
-      resp = [ctx.lastID];
-    } else if (builder.type === 'delete' || builder.type === 'update') {
-      resp = ctx.changes;
-    }
-    return resp;
-  }
-
-}, baseGrammar);
-},{"../../../lib/helpers":16,"../../base/sqlite3/grammar":4,"lodash":62}],10:[function(require,module,exports){
-// SQLite3 SchemaGrammar
-// -------
-var _                 = require('lodash');
-var baseSchemaGrammar = require('../../base/sqlite3/schemagrammar').schemaGrammar;
-
-exports.schemaGrammar = _.defaults({
-
-  // Ensures the response is returned in the same format as other clients.
-  handleResponse: function(builder, resp) {
-    // This is an array, so we'll assume that the relevant info is on the first statement...
-    resp = resp[0];
-    var ctx = resp[1]; resp = resp[0];
-    if (builder.type === 'tableExists') {
-      return resp.length > 0;
-    } else if (builder.type === 'columnExists') {
-      return _.findWhere(resp, {name: builder.bindings[1]}) != null;
-    }
-    return resp;
-  }
-
-}, baseSchemaGrammar);
-
-},{"../../base/sqlite3/schemagrammar":5,"lodash":62}],"qi+vRg":[function(require,module,exports){
-// Knex.js  0.5.7
-// --------------
-
-//     (c) 2013 Tim Griesser
-//     Knex may be freely distributed under the MIT license.
-//     For details and documentation:
-//     http://knexjs.org
-
-// Base library dependencies of the app.
-var _ = require('lodash');
-
-// Require the main constructors necessary for a `Knex` instance,
-// each of which are injected with the current instance, so they maintain
-// the correct client reference & grammar.
-var Raw         = require('./lib/raw').Raw;
-var Transaction = require('./lib/transaction').Transaction;
-var Builder     = require('./lib/builder').Builder;
-var Promise     = require('./lib/promise').Promise;
-
-var ClientBase       = require('./clients/base').ClientBase;
-var SchemaBuilder    = require('./lib/schemabuilder').SchemaBuilder;
-var SchemaInterface  = require('./lib/schemainterface').SchemaInterface;
-var RestClient    = require('./clients/server/rest').Client;
-
-// The `Knex` module, taking either a fully initialized
-// database client, or a configuration to initialize one. This is something
-// you'll typically only want to call once per application cycle.
-var Knex = function(config) {
-
-  var Dialect, client;
-
-  // If the client isn't actually a client, we need to configure it into one.
-  // On the client, this isn't acceptable, since we need to return immediately
-  // rather than wait on an async load of a client library.
-  if (config instanceof ClientBase) {
-    client = config;
+  // The top-level namespace. All public Backbone classes and modules will
+  // be attached to this. Exported for both the browser and the server.
+  var Backbone;
+  if (typeof exports !== 'undefined') {
+    Backbone = exports;
   } else {
-    if (typeof define === 'function' && define.amd) {
-      throw new Error('A valid `Knex` client must be passed into the Knex constructor.');
-    } else  {
-      client = new RestClient(_.omit(config, 'client'));
-    }
+    Backbone = root.Backbone = {};
   }
 
-  // Enables the `knex('tableName')` shorthand syntax.
-  var knex = function(tableName) {
-    return knex.builder(tableName);
+  // Current version of the library. Keep in sync with `package.json`.
+  Backbone.VERSION = '1.1.0';
+
+  // Require Underscore, if we're on the server, and it's not already present.
+  var _ = root._;
+  if (!_ && (typeof require !== 'undefined')) _ = require('underscore');
+
+  // For Backbone's purposes, jQuery, Zepto, Ender, or My Library (kidding) owns
+  // the `$` variable.
+  Backbone.$ = root.jQuery || root.Zepto || root.ender || root.$;
+
+  // Runs Backbone.js in *noConflict* mode, returning the `Backbone` variable
+  // to its previous owner. Returns a reference to this Backbone object.
+  Backbone.noConflict = function() {
+    root.Backbone = previousBackbone;
+    return this;
   };
 
-  knex.grammar       = client.grammar;
-  knex.schemaGrammar = client.schemaGrammar;
+  // Turn on `emulateHTTP` to support legacy HTTP servers. Setting this option
+  // will fake `"PATCH"`, `"PUT"` and `"DELETE"` requests via the `_method` parameter and
+  // set a `X-Http-Method-Override` header.
+  Backbone.emulateHTTP = false;
 
-  // Main namespaces for key library components.
-  knex.schema  = {};
-  knex.migrate = {};
+  // Turn on `emulateJSON` to support legacy servers that can't deal with direct
+  // `application/json` requests ... will encode the body as
+  // `application/x-www-form-urlencoded` instead and will send the model in a
+  // form param named `model`.
+  Backbone.emulateJSON = false;
 
-  // Enable the `Builder('tableName')` syntax, as is used in the main `knex('tableName')`.
-  knex.builder = function(tableName) {
-    var builder = new Builder(knex);
-    return tableName ? builder.from(tableName) : builder;
-  };
+  // Backbone.Events
+  // ---------------
 
-  // Attach each of the `Schema` "interface" methods directly onto to `knex.schema` namespace, e.g.:
-  // `knex.schema.table('tableName', function() {...`
-  // `knex.schema.createTable('tableName', function() {...`
-  // `knex.schema.dropTableIfExists('tableName');`
-  _.each(SchemaInterface, function(val, key) {
-    knex.schema[key] = function() {
-      var schemaBuilder = new SchemaBuilder(knex);
-      var table = schemaBuilder.table = _.first(arguments);
-      if (!table) {
-        return Promise.reject(new Error('The table must be defined for the ' + key + ' method.'));
+  // A module that can be mixed in to *any object* in order to provide it with
+  // custom events. You may bind with `on` or remove with `off` callback
+  // functions to an event; `trigger`-ing an event fires all callbacks in
+  // succession.
+  //
+  //     var object = {};
+  //     _.extend(object, Backbone.Events);
+  //     object.on('expand', function(){ alert('expanded'); });
+  //     object.trigger('expand');
+  //
+  var Events = Backbone.Events = {
+
+    // Bind an event to a `callback` function. Passing `"all"` will bind
+    // the callback to all events fired.
+    on: function(name, callback, context) {
+      if (!eventsApi(this, 'on', name, [callback, context]) || !callback) return this;
+      this._events || (this._events = {});
+      var events = this._events[name] || (this._events[name] = []);
+      events.push({callback: callback, context: context, ctx: context || this});
+      return this;
+    },
+
+    // Bind an event to only be triggered a single time. After the first time
+    // the callback is invoked, it will be removed.
+    once: function(name, callback, context) {
+      if (!eventsApi(this, 'once', name, [callback, context]) || !callback) return this;
+      var self = this;
+      var once = _.once(function() {
+        self.off(name, once);
+        callback.apply(this, arguments);
+      });
+      once._callback = callback;
+      return this.on(name, once, context);
+    },
+
+    // Remove one or many callbacks. If `context` is null, removes all
+    // callbacks with that function. If `callback` is null, removes all
+    // callbacks for the event. If `name` is null, removes all bound
+    // callbacks for all events.
+    off: function(name, callback, context) {
+      var retain, ev, events, names, i, l, j, k;
+      if (!this._events || !eventsApi(this, 'off', name, [callback, context])) return this;
+      if (!name && !callback && !context) {
+        this._events = {};
+        return this;
       }
-      return SchemaInterface[key].apply(schemaBuilder, _.rest(arguments));
-    };
-  });
+      names = name ? [name] : _.keys(this._events);
+      for (i = 0, l = names.length; i < l; i++) {
+        name = names[i];
+        if (events = this._events[name]) {
+          this._events[name] = retain = [];
+          if (callback || context) {
+            for (j = 0, k = events.length; j < k; j++) {
+              ev = events[j];
+              if ((callback && callback !== ev.callback && callback !== ev.callback._callback) ||
+                  (context && context !== ev.context)) {
+                retain.push(ev);
+              }
+            }
+          }
+          if (!retain.length) delete this._events[name];
+        }
+      }
 
-  // Method to run a new `Raw` query on the current client.
-  knex.raw = function(sql, bindings) {
-    return new Raw(knex).query(sql, bindings);
-  };
+      return this;
+    },
 
-  // Keep a reference to the current client.
-  knex.client = client;
+    // Trigger one or many events, firing all bound callbacks. Callbacks are
+    // passed the same arguments as `trigger` is, apart from the event name
+    // (unless you're listening on `"all"`, which will cause your callback to
+    // receive the true name of the event as the first argument).
+    trigger: function(name) {
+      if (!this._events) return this;
+      var args = slice.call(arguments, 1);
+      if (!eventsApi(this, 'trigger', name, args)) return this;
+      var events = this._events[name];
+      var allEvents = this._events.all;
+      if (events) triggerEvents(events, args);
+      if (allEvents) triggerEvents(allEvents, arguments);
+      return this;
+    },
 
-  // Keep in sync with package.json
-  knex.VERSION = '0.5.7';
-
-  // Runs a new transaction, taking a container and returning a promise
-  // for when the transaction is resolved.
-  knex.transaction = function(container) {
-    return new Transaction(knex).run(container);
-  };
-
-  // Return the new `Knex` instance.
-  return knex;
-};
-
-// The client names we'll allow in the `{name: lib}` pairing.
-var Clients = Knex.Clients = {
-  'catalog'    : './clients/server/catalog'
-};
-
-// Used primarily to type-check a potential `Knex` client in `Bookshelf.js`,
-// by examining whether the object's `client` is an `instanceof Knex.ClientBase`.
-Knex.ClientBase = ClientBase;
-
-// finally, export the `Knex` object for node and the browser.
-module.exports = Knex;
-
-Knex.initialize = function(config) {
-  return Knex(config);
-};
-},{"./clients/base":1,"./clients/server/rest":8,"./lib/builder":13,"./lib/promise":17,"./lib/raw":18,"./lib/schemabuilder":19,"./lib/schemainterface":20,"./lib/transaction":22,"lodash":62}],"knex":[function(require,module,exports){
-module.exports=require('qi+vRg');
-},{}],13:[function(require,module,exports){
-// Builder
-// -------
-var _          = require('lodash');
-
-var Raw        = require('./raw').Raw;
-var Common     = require('./common').Common;
-var Helpers    = require('./helpers').Helpers;
-var JoinClause = require('./builder/joinclause').JoinClause;
-
-var array      = [];
-var push       = array.push;
-
-// Constructor for the builder instance, typically called from
-// `knex.builder`, accepting the current `knex` instance,
-// and pulling out the `client` and `grammar` from the current
-// knex instance.
-var Builder = function(knex) {
-  this.knex    = knex;
-  this.client  = knex.client;
-  this.grammar = knex.grammar;
-  this.reset();
-  _.bindAll(this, 'handleResponse');
-};
-
-// All operators used in the `where` clause generation.
-var operators = ['=', '<', '>', '<=', '>=', '<>', '!=', 'like', 'not like', 'between', 'ilike'];
-
-// Valid values for the `order by` clause generation.
-var orderBys  = ['asc', 'desc'];
-
-_.extend(Builder.prototype, Common, {
-
-  _source: 'Builder',
-
-  // Sets the `tableName` on the query.
-  from: function(tableName) {
-    if (!tableName) return this.table;
-    this.table = tableName;
-    return this;
-  },
-
-  // Alias to from, for "insert" statements
-  // e.g. builder.insert({a: value}).into('tableName')
-  into: function(tableName) {
-    this.table = tableName;
-    return this;
-  },
-
-  // Adds a column or columns to the list of "columns"
-  // being selected on the query.
-  column: function(columns) {
-    if (columns) {
-      push.apply(this.columns, _.isArray(columns) ? columns : _.toArray(arguments));
-    }
-    return this;
-  },
-
-  // Adds a `distinct` clause to the query.
-  distinct: function(column) {
-    this.column(column);
-    this.flags.distinct = true;
-    return this;
-  },
-
-  // Clones the current query builder, including any
-  // pieces that have been set thus far.
-  clone: function() {
-    var item = new Builder(this.knex);
-        item.table = this.table;
-    var items = [
-      'aggregates', 'type', 'joins', 'wheres', 'orders',
-      'columns', 'values', 'bindings', 'grammar', 'groups',
-      'transaction', 'unions', 'flags', 'havings'
-    ];
-    for (var i = 0, l = items.length; i < l; i++) {
-      var k = items[i];
-      item[k] = this[k];
-    }
-    return item;
-  },
-
-  // Resets all attributes on the query builder.
-  reset: function() {
-    this.aggregates = [];
-    this.bindings   = [];
-    this.columns    = [];
-    this.flags      = {};
-    this.havings    = [];
-    this.joins      = [];
-    this.orders     = [];
-    this.unions     = [];
-    this.values     = [];
-    this.wheres     = [];
-  },
-
-  // Adds a join clause to the query, allowing for advanced joins
-  // with an anonymous function as the second argument.
-  join: function(table, first, operator, second, type) {
-    var join;
-    if (_.isFunction(first)) {
-      type = operator;
-      join = new JoinClause(type || 'inner', table);
-      first.call(join, join);
-    } else {
-      join = new JoinClause(type || 'inner', table);
-      join.on(first, operator, second);
-    }
-    this.joins.push(join);
-    return this;
-  },
-
-  // The where function can be used in several ways:
-  // The most basic is `where(key, value)`, which expands to
-  // where key = value.
-  where: function(column, operator, value) {
-    var bool = this._boolFlag || 'and';
-    this._boolFlag = 'and';
-
-    // Check if the column is a function, in which case it's
-    // a grouped where statement (wrapped in parens).
-    if (_.isFunction(column)) {
-      return this._whereNested(column, bool);
-    }
-
-    // Allow a raw statement to be passed along to the query.
-    if (column instanceof Raw) {
-      return this.whereRaw(column.sql, column.bindings, bool);
-    }
-
-    // Allows `where({id: 2})` syntax.
-    if (_.isObject(column)) {
-      for (var key in column) {
-        value = column[key];
-        this[bool + 'Where'](key, '=', value);
+    // Tell this object to stop listening to either specific events ... or
+    // to every object it's currently listening to.
+    stopListening: function(obj, name, callback) {
+      var listeningTo = this._listeningTo;
+      if (!listeningTo) return this;
+      var remove = !name && !callback;
+      if (!callback && typeof name === 'object') callback = this;
+      if (obj) (listeningTo = {})[obj._listenId] = obj;
+      for (var id in listeningTo) {
+        obj = listeningTo[id];
+        obj.off(name, callback, this);
+        if (remove || _.isEmpty(obj._events)) delete this._listeningTo[id];
       }
       return this;
     }
 
-    // Enable the where('key', value) syntax, only when there
-    // are explicitly two arguments passed, so it's not possible to
-    // do where('key', '!=') and have that turn into where key != null
-    if (arguments.length === 2) {
-      value    = operator;
-      operator = '=';
+  };
+
+  // Regular expression used to split event strings.
+  var eventSplitter = /\s+/;
+
+  // Implement fancy features of the Events API such as multiple event
+  // names `"change blur"` and jQuery-style event maps `{change: action}`
+  // in terms of the existing API.
+  var eventsApi = function(obj, action, name, rest) {
+    if (!name) return true;
+
+    // Handle event maps.
+    if (typeof name === 'object') {
+      for (var key in name) {
+        obj[action].apply(obj, [key, name[key]].concat(rest));
+      }
+      return false;
     }
 
-    // If the value is null, and the operator is equals, assume that we're
-    // going for a `whereNull` statement here.
-    if (value == null && operator === '=') {
-      return this.whereNull(column, bool);
+    // Handle space separated event names.
+    if (eventSplitter.test(name)) {
+      var names = name.split(eventSplitter);
+      for (var i = 0, l = names.length; i < l; i++) {
+        obj[action].apply(obj, [names[i]].concat(rest));
+      }
+      return false;
     }
 
-    // If the value is a function, assume it's for building a sub-select.
-    if (_.isFunction(value)) {
-      return this._whereSub(column, operator, value, bool);
+    return true;
+  };
+
+  // A difficult-to-believe, but optimized internal dispatch function for
+  // triggering events. Tries to keep the usual cases speedy (most internal
+  // Backbone events have 3 arguments).
+  var triggerEvents = function(events, args) {
+    var ev, i = -1, l = events.length, a1 = args[0], a2 = args[1], a3 = args[2];
+    switch (args.length) {
+      case 0: while (++i < l) (ev = events[i]).callback.call(ev.ctx); return;
+      case 1: while (++i < l) (ev = events[i]).callback.call(ev.ctx, a1); return;
+      case 2: while (++i < l) (ev = events[i]).callback.call(ev.ctx, a1, a2); return;
+      case 3: while (++i < l) (ev = events[i]).callback.call(ev.ctx, a1, a2, a3); return;
+      default: while (++i < l) (ev = events[i]).callback.apply(ev.ctx, args);
+    }
+  };
+
+  var listenMethods = {listenTo: 'on', listenToOnce: 'once'};
+
+  // Inversion-of-control versions of `on` and `once`. Tell *this* object to
+  // listen to an event in another object ... keeping track of what it's
+  // listening to.
+  _.each(listenMethods, function(implementation, method) {
+    Events[method] = function(obj, name, callback) {
+      var listeningTo = this._listeningTo || (this._listeningTo = {});
+      var id = obj._listenId || (obj._listenId = _.uniqueId('l'));
+      listeningTo[id] = obj;
+      if (!callback && typeof name === 'object') callback = this;
+      obj[implementation](name, callback, this);
+      return this;
+    };
+  });
+
+  // Aliases for backwards compatibility.
+  Events.bind   = Events.on;
+  Events.unbind = Events.off;
+
+  // Allow the `Backbone` object to serve as a global event bus, for folks who
+  // want global "pubsub" in a convenient place.
+  _.extend(Backbone, Events);
+
+  // Backbone.Model
+  // --------------
+
+  // Backbone **Models** are the basic data object in the framework --
+  // frequently representing a row in a table in a database on your server.
+  // A discrete chunk of data and a bunch of useful, related methods for
+  // performing computations and transformations on that data.
+
+  // Create a new model with the specified attributes. A client id (`cid`)
+  // is automatically generated and assigned for you.
+  var Model = Backbone.Model = function(attributes, options) {
+    var attrs = attributes || {};
+    options || (options = {});
+    this.cid = _.uniqueId('c');
+    this.attributes = {};
+    if (options.collection) this.collection = options.collection;
+    if (options.parse) attrs = this.parse(attrs, options) || {};
+    attrs = _.defaults({}, attrs, _.result(this, 'defaults'));
+    this.set(attrs, options);
+    this.changed = {};
+    this.initialize.apply(this, arguments);
+  };
+
+  // Attach all inheritable methods to the Model prototype.
+  _.extend(Model.prototype, Events, {
+
+    // A hash of attributes whose current and previous value differ.
+    changed: null,
+
+    // The value returned during the last failed validation.
+    validationError: null,
+
+    // The default name for the JSON `id` attribute is `"id"`. MongoDB and
+    // CouchDB users may want to set this to `"_id"`.
+    idAttribute: 'id',
+
+    // Initialize is an empty function by default. Override it with your own
+    // initialization logic.
+    initialize: function(){},
+
+    // Return a copy of the model's `attributes` object.
+    toJSON: function(options) {
+      return _.clone(this.attributes);
+    },
+
+    // Proxy `Backbone.sync` by default -- but override this if you need
+    // custom syncing semantics for *this* particular model.
+    sync: function() {
+      return Backbone.sync.apply(this, arguments);
+    },
+
+    // Get the value of an attribute.
+    get: function(attr) {
+      return this.attributes[attr];
+    },
+
+    // Get the HTML-escaped value of an attribute.
+    escape: function(attr) {
+      return _.escape(this.get(attr));
+    },
+
+    // Returns `true` if the attribute contains a value that is not null
+    // or undefined.
+    has: function(attr) {
+      return this.get(attr) != null;
+    },
+
+    // Set a hash of model attributes on the object, firing `"change"`. This is
+    // the core primitive operation of a model, updating the data and notifying
+    // anyone who needs to know about the change in state. The heart of the beast.
+    set: function(key, val, options) {
+      var attr, attrs, unset, changes, silent, changing, prev, current;
+      if (key == null) return this;
+
+      // Handle both `"key", value` and `{key: value}` -style arguments.
+      if (typeof key === 'object') {
+        attrs = key;
+        options = val;
+      } else {
+        (attrs = {})[key] = val;
+      }
+
+      options || (options = {});
+
+      // Run validation.
+      if (!this._validate(attrs, options)) return false;
+
+      // Extract attributes and options.
+      unset           = options.unset;
+      silent          = options.silent;
+      changes         = [];
+      changing        = this._changing;
+      this._changing  = true;
+
+      if (!changing) {
+        this._previousAttributes = _.clone(this.attributes);
+        this.changed = {};
+      }
+      current = this.attributes, prev = this._previousAttributes;
+
+      // Check for changes of `id`.
+      if (this.idAttribute in attrs) this.id = attrs[this.idAttribute];
+
+      // For each `set` attribute, update or delete the current value.
+      for (attr in attrs) {
+        val = attrs[attr];
+        if (!_.isEqual(current[attr], val)) changes.push(attr);
+        if (!_.isEqual(prev[attr], val)) {
+          this.changed[attr] = val;
+        } else {
+          delete this.changed[attr];
+        }
+        unset ? delete current[attr] : current[attr] = val;
+      }
+
+      // Trigger all relevant attribute changes.
+      if (!silent) {
+        if (changes.length) this._pending = true;
+        for (var i = 0, l = changes.length; i < l; i++) {
+          this.trigger('change:' + changes[i], this, current[changes[i]], options);
+        }
+      }
+
+      // You might be wondering why there's a `while` loop here. Changes can
+      // be recursively nested within `"change"` events.
+      if (changing) return this;
+      if (!silent) {
+        while (this._pending) {
+          this._pending = false;
+          this.trigger('change', this, options);
+        }
+      }
+      this._pending = false;
+      this._changing = false;
+      return this;
+    },
+
+    // Remove an attribute from the model, firing `"change"`. `unset` is a noop
+    // if the attribute doesn't exist.
+    unset: function(attr, options) {
+      return this.set(attr, void 0, _.extend({}, options, {unset: true}));
+    },
+
+    // Clear all attributes on the model, firing `"change"`.
+    clear: function(options) {
+      var attrs = {};
+      for (var key in this.attributes) attrs[key] = void 0;
+      return this.set(attrs, _.extend({}, options, {unset: true}));
+    },
+
+    // Determine if the model has changed since the last `"change"` event.
+    // If you specify an attribute name, determine if that attribute has changed.
+    hasChanged: function(attr) {
+      if (attr == null) return !_.isEmpty(this.changed);
+      return _.has(this.changed, attr);
+    },
+
+    // Return an object containing all the attributes that have changed, or
+    // false if there are no changed attributes. Useful for determining what
+    // parts of a view need to be updated and/or what attributes need to be
+    // persisted to the server. Unset attributes will be set to undefined.
+    // You can also pass an attributes object to diff against the model,
+    // determining if there *would be* a change.
+    changedAttributes: function(diff) {
+      if (!diff) return this.hasChanged() ? _.clone(this.changed) : false;
+      var val, changed = false;
+      var old = this._changing ? this._previousAttributes : this.attributes;
+      for (var attr in diff) {
+        if (_.isEqual(old[attr], (val = diff[attr]))) continue;
+        (changed || (changed = {}))[attr] = val;
+      }
+      return changed;
+    },
+
+    // Get the previous value of an attribute, recorded at the time the last
+    // `"change"` event was fired.
+    previous: function(attr) {
+      if (attr == null || !this._previousAttributes) return null;
+      return this._previousAttributes[attr];
+    },
+
+    // Get all of the attributes of the model at the time of the previous
+    // `"change"` event.
+    previousAttributes: function() {
+      return _.clone(this._previousAttributes);
+    },
+
+    // Fetch the model from the server. If the server's representation of the
+    // model differs from its current attributes, they will be overridden,
+    // triggering a `"change"` event.
+    fetch: function(options) {
+      options = options ? _.clone(options) : {};
+      if (options.parse === void 0) options.parse = true;
+      var model = this;
+      var success = options.success;
+      options.success = function(resp) {
+        if (!model.set(model.parse(resp, options), options)) return false;
+        if (success) success(model, resp, options);
+        model.trigger('sync', model, resp, options);
+      };
+      wrapError(this, options);
+      return this.sync('read', this, options);
+    },
+
+    // Set a hash of model attributes, and sync the model to the server.
+    // If the server returns an attributes hash that differs, the model's
+    // state will be `set` again.
+    save: function(key, val, options) {
+      var attrs, method, xhr, attributes = this.attributes;
+
+      // Handle both `"key", value` and `{key: value}` -style arguments.
+      if (key == null || typeof key === 'object') {
+        attrs = key;
+        options = val;
+      } else {
+        (attrs = {})[key] = val;
+      }
+
+      options = _.extend({validate: true}, options);
+
+      // If we're not waiting and attributes exist, save acts as
+      // `set(attr).save(null, opts)` with validation. Otherwise, check if
+      // the model will be valid when the attributes, if any, are set.
+      if (attrs && !options.wait) {
+        if (!this.set(attrs, options)) return false;
+      } else {
+        if (!this._validate(attrs, options)) return false;
+      }
+
+      // Set temporary attributes if `{wait: true}`.
+      if (attrs && options.wait) {
+        this.attributes = _.extend({}, attributes, attrs);
+      }
+
+      // After a successful server-side save, the client is (optionally)
+      // updated with the server-side state.
+      if (options.parse === void 0) options.parse = true;
+      var model = this;
+      var success = options.success;
+      options.success = function(resp) {
+        // Ensure attributes are restored during synchronous saves.
+        model.attributes = attributes;
+        var serverAttrs = model.parse(resp, options);
+        if (options.wait) serverAttrs = _.extend(attrs || {}, serverAttrs);
+        if (_.isObject(serverAttrs) && !model.set(serverAttrs, options)) {
+          return false;
+        }
+        if (success) success(model, resp, options);
+        model.trigger('sync', model, resp, options);
+      };
+      wrapError(this, options);
+
+      method = this.isNew() ? 'create' : (options.patch ? 'patch' : 'update');
+      if (method === 'patch') options.attrs = attrs;
+      xhr = this.sync(method, this, options);
+
+      // Restore attributes.
+      if (attrs && options.wait) this.attributes = attributes;
+
+      return xhr;
+    },
+
+    // Destroy this model on the server if it was already persisted.
+    // Optimistically removes the model from its collection, if it has one.
+    // If `wait: true` is passed, waits for the server to respond before removal.
+    destroy: function(options) {
+      options = options ? _.clone(options) : {};
+      var model = this;
+      var success = options.success;
+
+      var destroy = function() {
+        model.trigger('destroy', model, model.collection, options);
+      };
+
+      options.success = function(resp) {
+        if (options.wait || model.isNew()) destroy();
+        if (success) success(model, resp, options);
+        if (!model.isNew()) model.trigger('sync', model, resp, options);
+      };
+
+      if (this.isNew()) {
+        options.success();
+        return false;
+      }
+      wrapError(this, options);
+
+      var xhr = this.sync('delete', this, options);
+      if (!options.wait) destroy();
+      return xhr;
+    },
+
+    // Default URL for the model's representation on the server -- if you're
+    // using Backbone's restful methods, override this to change the endpoint
+    // that will be called.
+    url: function() {
+      var base = _.result(this, 'urlRoot') || _.result(this.collection, 'url') || urlError();
+      if (this.isNew()) return base;
+      return base + (base.charAt(base.length - 1) === '/' ? '' : '/') + encodeURIComponent(this.id);
+    },
+
+    // **parse** converts a response into the hash of attributes to be `set` on
+    // the model. The default implementation is just to pass the response along.
+    parse: function(resp, options) {
+      return resp;
+    },
+
+    // Create a new model with identical attributes to this one.
+    clone: function() {
+      return new this.constructor(this.attributes);
+    },
+
+    // A model is new if it has never been saved to the server, and lacks an id.
+    isNew: function() {
+      return this.id == null;
+    },
+
+    // Check if the model is currently in a valid state.
+    isValid: function(options) {
+      return this._validate({}, _.extend(options || {}, { validate: true }));
+    },
+
+    // Run validation against the next complete set of model attributes,
+    // returning `true` if all is well. Otherwise, fire an `"invalid"` event.
+    _validate: function(attrs, options) {
+      if (!options.validate || !this.validate) return true;
+      attrs = _.extend({}, this.attributes, attrs);
+      var error = this.validationError = this.validate(attrs, options) || null;
+      if (!error) return true;
+      this.trigger('invalid', this, error, _.extend(options, {validationError: error}));
+      return false;
     }
 
-    this.wheres.push({
-      type: 'Basic',
-      column: column,
-      operator: operator,
-      value: value,
-      bool: bool
-    });
-    this.bindings.push(value);
+  });
 
-    return this;
-  },
+  // Underscore methods that we want to implement on the Model.
+  var modelMethods = ['keys', 'values', 'pairs', 'invert', 'pick', 'omit'];
 
-  // Alias to `where`, for internal builder consistency.
-  andWhere: function(column, operator, value) {
-    return this.where.apply(this, arguments);
-  },
+  // Mix in each Underscore method as a proxy to `Model#attributes`.
+  _.each(modelMethods, function(method) {
+    Model.prototype[method] = function() {
+      var args = slice.call(arguments);
+      args.unshift(this.attributes);
+      return _[method].apply(_, args);
+    };
+  });
 
-  // Adds an `or where` clause to the query.
-  orWhere: function(column, operator, value) {
-    this._boolFlag = 'or';
-    return this.where.apply(this, arguments);
-  },
+  // Backbone.Collection
+  // -------------------
 
-  // Adds a raw `where` clause to the query.
-  whereRaw: function(sql, bindings, bool) {
-    bindings = _.isArray(bindings) ? bindings : (bindings ? [bindings] : []);
-    this.wheres.push({type: 'Raw', sql: sql, bool: bool || 'and'});
-    push.apply(this.bindings, bindings);
-    return this;
-  },
+  // If models tend to represent a single row of data, a Backbone Collection is
+  // more analagous to a table full of data ... or a small slice or page of that
+  // table, or a collection of rows that belong together for a particular reason
+  // -- all of the messages in this particular folder, all of the documents
+  // belonging to this particular author, and so on. Collections maintain
+  // indexes of their models, both in order, and for lookup by `id`.
 
-  // Adds a raw `or where` clause to the query.
-  orWhereRaw: function(sql, bindings) {
-    return this.whereRaw(sql, bindings, 'or');
-  },
+  // Create a new **Collection**, perhaps to contain a specific type of `model`.
+  // If a `comparator` is specified, the Collection will maintain
+  // its models in sort order, as they're added and removed.
+  var Collection = Backbone.Collection = function(models, options) {
+    options || (options = {});
+    if (options.model) this.model = options.model;
+    if (options.comparator !== void 0) this.comparator = options.comparator;
+    this._reset();
+    this.initialize.apply(this, arguments);
+    if (models) this.reset(models, _.extend({silent: true}, options));
+  };
 
-  // Adds a `where exists` clause to the query.
-  whereExists: function(callback, bool, type) {
-    var query = new Builder(this.knex);
-    callback.call(query, query);
-    this.wheres.push({
-      type: (type || 'Exists'),
-      query: query,
-      bool: (bool || 'and')
-    });
-    push.apply(this.bindings, query.bindings);
-    return this;
-  },
+  // Default options for `Collection#set`.
+  var setOptions = {add: true, remove: true, merge: true};
+  var addOptions = {add: true, remove: false};
 
-  // Adds an `or where exists` clause to the query.
-  orWhereExists: function(callback) {
-    return this.whereExists(callback, 'or');
-  },
+  // Define the Collection's inheritable methods.
+  _.extend(Collection.prototype, Events, {
 
-  // Adds a `where not exists` clause to the query.
-  whereNotExists: function(callback) {
-    return this.whereExists(callback, 'and', 'NotExists');
-  },
+    // The default model for a collection is just a **Backbone.Model**.
+    // This should be overridden in most cases.
+    model: Model,
 
-  // Adds a `or where not exists` clause to the query.
-  orWhereNotExists: function(callback) {
-    return this.whereExists(callback, 'or', 'NotExists');
-  },
+    // Initialize is an empty function by default. Override it with your own
+    // initialization logic.
+    initialize: function(){},
 
-  // Adds a `where in` clause to the query.
-  whereIn: function(column, values, bool, condition) {
-    bool || (bool = 'and');
-    if (_.isFunction(values)) {
-      return this._whereInSub(column, values, bool, (condition || 'In'));
+    // The JSON representation of a Collection is an array of the
+    // models' attributes.
+    toJSON: function(options) {
+      return this.map(function(model){ return model.toJSON(options); });
+    },
+
+    // Proxy `Backbone.sync` by default.
+    sync: function() {
+      return Backbone.sync.apply(this, arguments);
+    },
+
+    // Add a model, or list of models to the set.
+    add: function(models, options) {
+      return this.set(models, _.extend({merge: false}, options, addOptions));
+    },
+
+    // Remove a model, or a list of models from the set.
+    remove: function(models, options) {
+      var singular = !_.isArray(models);
+      models = singular ? [models] : _.clone(models);
+      options || (options = {});
+      var i, l, index, model;
+      for (i = 0, l = models.length; i < l; i++) {
+        model = models[i] = this.get(models[i]);
+        if (!model) continue;
+        delete this._byId[model.id];
+        delete this._byId[model.cid];
+        index = this.indexOf(model);
+        this.models.splice(index, 1);
+        this.length--;
+        if (!options.silent) {
+          options.index = index;
+          model.trigger('remove', model, this, options);
+        }
+        this._removeReference(model);
+      }
+      return singular ? models[0] : models;
+    },
+
+    // Update a collection by `set`-ing a new list of models, adding new ones,
+    // removing models that are no longer present, and merging models that
+    // already exist in the collection, as necessary. Similar to **Model#set**,
+    // the core operation for updating the data contained by the collection.
+    set: function(models, options) {
+      options = _.defaults({}, options, setOptions);
+      if (options.parse) models = this.parse(models, options);
+      var singular = !_.isArray(models);
+      models = singular ? (models ? [models] : []) : _.clone(models);
+      var i, l, id, model, attrs, existing, sort;
+      var at = options.at;
+      var targetModel = this.model;
+      var sortable = this.comparator && (at == null) && options.sort !== false;
+      var sortAttr = _.isString(this.comparator) ? this.comparator : null;
+      var toAdd = [], toRemove = [], modelMap = {};
+      var add = options.add, merge = options.merge, remove = options.remove;
+      var order = !sortable && add && remove ? [] : false;
+
+      // Turn bare objects into model references, and prevent invalid models
+      // from being added.
+      for (i = 0, l = models.length; i < l; i++) {
+        attrs = models[i];
+        if (attrs instanceof Model) {
+          id = model = attrs;
+        } else {
+          id = attrs[targetModel.prototype.idAttribute];
+        }
+
+        // If a duplicate is found, prevent it from being added and
+        // optionally merge it into the existing model.
+        if (existing = this.get(id)) {
+          if (remove) modelMap[existing.cid] = true;
+          if (merge) {
+            attrs = attrs === model ? model.attributes : attrs;
+            if (options.parse) attrs = existing.parse(attrs, options);
+            existing.set(attrs, options);
+            if (sortable && !sort && existing.hasChanged(sortAttr)) sort = true;
+          }
+          models[i] = existing;
+
+        // If this is a new, valid model, push it to the `toAdd` list.
+        } else if (add) {
+          model = models[i] = this._prepareModel(attrs, options);
+          if (!model) continue;
+          toAdd.push(model);
+
+          // Listen to added models' events, and index models for lookup by
+          // `id` and by `cid`.
+          model.on('all', this._onModelEvent, this);
+          this._byId[model.cid] = model;
+          if (model.id != null) this._byId[model.id] = model;
+        }
+        if (order) order.push(existing || model);
+      }
+
+      // Remove nonexistent models if appropriate.
+      if (remove) {
+        for (i = 0, l = this.length; i < l; ++i) {
+          if (!modelMap[(model = this.models[i]).cid]) toRemove.push(model);
+        }
+        if (toRemove.length) this.remove(toRemove, options);
+      }
+
+      // See if sorting is needed, update `length` and splice in new models.
+      if (toAdd.length || (order && order.length)) {
+        if (sortable) sort = true;
+        this.length += toAdd.length;
+        if (at != null) {
+          for (i = 0, l = toAdd.length; i < l; i++) {
+            this.models.splice(at + i, 0, toAdd[i]);
+          }
+        } else {
+          if (order) this.models.length = 0;
+          var orderedModels = order || toAdd;
+          for (i = 0, l = orderedModels.length; i < l; i++) {
+            this.models.push(orderedModels[i]);
+          }
+        }
+      }
+
+      // Silently sort the collection if appropriate.
+      if (sort) this.sort({silent: true});
+
+      // Unless silenced, it's time to fire all appropriate add/sort events.
+      if (!options.silent) {
+        for (i = 0, l = toAdd.length; i < l; i++) {
+          (model = toAdd[i]).trigger('add', model, this, options);
+        }
+        if (sort || (order && order.length)) this.trigger('sort', this, options);
+      }
+      
+      // Return the added (or merged) model (or models).
+      return singular ? models[0] : models;
+    },
+
+    // When you have more items than you want to add or remove individually,
+    // you can reset the entire set with a new list of models, without firing
+    // any granular `add` or `remove` events. Fires `reset` when finished.
+    // Useful for bulk operations and optimizations.
+    reset: function(models, options) {
+      options || (options = {});
+      for (var i = 0, l = this.models.length; i < l; i++) {
+        this._removeReference(this.models[i]);
+      }
+      options.previousModels = this.models;
+      this._reset();
+      models = this.add(models, _.extend({silent: true}, options));
+      if (!options.silent) this.trigger('reset', this, options);
+      return models;
+    },
+
+    // Add a model to the end of the collection.
+    push: function(model, options) {
+      return this.add(model, _.extend({at: this.length}, options));
+    },
+
+    // Remove a model from the end of the collection.
+    pop: function(options) {
+      var model = this.at(this.length - 1);
+      this.remove(model, options);
+      return model;
+    },
+
+    // Add a model to the beginning of the collection.
+    unshift: function(model, options) {
+      return this.add(model, _.extend({at: 0}, options));
+    },
+
+    // Remove a model from the beginning of the collection.
+    shift: function(options) {
+      var model = this.at(0);
+      this.remove(model, options);
+      return model;
+    },
+
+    // Slice out a sub-array of models from the collection.
+    slice: function() {
+      return slice.apply(this.models, arguments);
+    },
+
+    // Get a model from the set by id.
+    get: function(obj) {
+      if (obj == null) return void 0;
+      return this._byId[obj.id] || this._byId[obj.cid] || this._byId[obj];
+    },
+
+    // Get the model at the given index.
+    at: function(index) {
+      return this.models[index];
+    },
+
+    // Return models with matching attributes. Useful for simple cases of
+    // `filter`.
+    where: function(attrs, first) {
+      if (_.isEmpty(attrs)) return first ? void 0 : [];
+      return this[first ? 'find' : 'filter'](function(model) {
+        for (var key in attrs) {
+          if (attrs[key] !== model.get(key)) return false;
+        }
+        return true;
+      });
+    },
+
+    // Return the first model with matching attributes. Useful for simple cases
+    // of `find`.
+    findWhere: function(attrs) {
+      return this.where(attrs, true);
+    },
+
+    // Force the collection to re-sort itself. You don't need to call this under
+    // normal circumstances, as the set will maintain sort order as each item
+    // is added.
+    sort: function(options) {
+      if (!this.comparator) throw new Error('Cannot sort a set without a comparator');
+      options || (options = {});
+
+      // Run sort based on type of `comparator`.
+      if (_.isString(this.comparator) || this.comparator.length === 1) {
+        this.models = this.sortBy(this.comparator, this);
+      } else {
+        this.models.sort(_.bind(this.comparator, this));
+      }
+
+      if (!options.silent) this.trigger('sort', this, options);
+      return this;
+    },
+
+    // Pluck an attribute from each model in the collection.
+    pluck: function(attr) {
+      return _.invoke(this.models, 'get', attr);
+    },
+
+    // Fetch the default set of models for this collection, resetting the
+    // collection when they arrive. If `reset: true` is passed, the response
+    // data will be passed through the `reset` method instead of `set`.
+    fetch: function(options) {
+      options = options ? _.clone(options) : {};
+      if (options.parse === void 0) options.parse = true;
+      var success = options.success;
+      var collection = this;
+      options.success = function(resp) {
+        var method = options.reset ? 'reset' : 'set';
+        collection[method](resp, options);
+        if (success) success(collection, resp, options);
+        collection.trigger('sync', collection, resp, options);
+      };
+      wrapError(this, options);
+      return this.sync('read', this, options);
+    },
+
+    // Create a new instance of a model in this collection. Add the model to the
+    // collection immediately, unless `wait: true` is passed, in which case we
+    // wait for the server to agree.
+    create: function(model, options) {
+      options = options ? _.clone(options) : {};
+      if (!(model = this._prepareModel(model, options))) return false;
+      if (!options.wait) this.add(model, options);
+      var collection = this;
+      var success = options.success;
+      options.success = function(model, resp, options) {
+        if (options.wait) collection.add(model, options);
+        if (success) success(model, resp, options);
+      };
+      model.save(null, options);
+      return model;
+    },
+
+    // **parse** converts a response into a list of models to be added to the
+    // collection. The default implementation is just to pass it through.
+    parse: function(resp, options) {
+      return resp;
+    },
+
+    // Create a new collection with an identical list of models as this one.
+    clone: function() {
+      return new this.constructor(this.models);
+    },
+
+    // Private method to reset all internal state. Called when the collection
+    // is first initialized or reset.
+    _reset: function() {
+      this.length = 0;
+      this.models = [];
+      this._byId  = {};
+    },
+
+    // Prepare a hash of attributes (or other model) to be added to this
+    // collection.
+    _prepareModel: function(attrs, options) {
+      if (attrs instanceof Model) {
+        if (!attrs.collection) attrs.collection = this;
+        return attrs;
+      }
+      options = options ? _.clone(options) : {};
+      options.collection = this;
+      var model = new this.model(attrs, options);
+      if (!model.validationError) return model;
+      this.trigger('invalid', this, model.validationError, options);
+      return false;
+    },
+
+    // Internal method to sever a model's ties to a collection.
+    _removeReference: function(model) {
+      if (this === model.collection) delete model.collection;
+      model.off('all', this._onModelEvent, this);
+    },
+
+    // Internal method called every time a model in the set fires an event.
+    // Sets need to update their indexes when models change ids. All other
+    // events simply proxy through. "add" and "remove" events that originate
+    // in other collections are ignored.
+    _onModelEvent: function(event, model, collection, options) {
+      if ((event === 'add' || event === 'remove') && collection !== this) return;
+      if (event === 'destroy') this.remove(model, options);
+      if (model && event === 'change:' + model.idAttribute) {
+        delete this._byId[model.previous(model.idAttribute)];
+        if (model.id != null) this._byId[model.id] = model;
+      }
+      this.trigger.apply(this, arguments);
     }
-    this.wheres.push({
-      type: (condition || 'In'),
-      column: column,
-      value: values,
-      bool: bool
-    });
-    push.apply(this.bindings, values);
-    return this;
-  },
 
-  // Adds a `or where in` clause to the query.
-  orWhereIn: function(column, values) {
-    return this.whereIn(column, values, 'or');
-  },
+  });
 
-  // Adds a `where not in` clause to the query.
-  whereNotIn: function(column, values) {
-    return this.whereIn(column, values, 'and', 'NotIn');
-  },
+  // Underscore methods that we want to implement on the Collection.
+  // 90% of the core usefulness of Backbone Collections is actually implemented
+  // right here:
+  var methods = ['forEach', 'each', 'map', 'collect', 'reduce', 'foldl',
+    'inject', 'reduceRight', 'foldr', 'find', 'detect', 'filter', 'select',
+    'reject', 'every', 'all', 'some', 'any', 'include', 'contains', 'invoke',
+    'max', 'min', 'toArray', 'size', 'first', 'head', 'take', 'initial', 'rest',
+    'tail', 'drop', 'last', 'without', 'difference', 'indexOf', 'shuffle',
+    'lastIndexOf', 'isEmpty', 'chain'];
 
-  // Adds a `or where not in` clause to the query.
-  orWhereNotIn: function(column, values) {
-    return this.whereIn(column, values, 'or', 'NotIn');
-  },
+  // Mix in each Underscore method as a proxy to `Collection#models`.
+  _.each(methods, function(method) {
+    Collection.prototype[method] = function() {
+      var args = slice.call(arguments);
+      args.unshift(this.models);
+      return _[method].apply(_, args);
+    };
+  });
 
-  // Adds a `where null` clause to the query.
-  whereNull: function(column, bool, type) {
-    this.wheres.push({type: (type || 'Null'), column: column, bool: (bool || 'and')});
-    return this;
-  },
+  // Underscore methods that take a property name as an argument.
+  var attributeMethods = ['groupBy', 'countBy', 'sortBy'];
 
-  // Adds a `or where null` clause to the query.
-  orWhereNull: function(column) {
-    return this.whereNull(column, 'or', 'Null');
-  },
+  // Use attributes instead of properties.
+  _.each(attributeMethods, function(method) {
+    Collection.prototype[method] = function(value, context) {
+      var iterator = _.isFunction(value) ? value : function(model) {
+        return model.get(value);
+      };
+      return _[method](this.models, iterator, context);
+    };
+  });
 
-  // Adds a `where not null` clause to the query.
-  whereNotNull: function(column) {
-    return this.whereNull(column, 'and', 'NotNull');
-  },
+  // Backbone.View
+  // -------------
 
-  // Adds a `or where not null` clause to the query.
-  orWhereNotNull: function(column) {
-    return this.whereNull(column, 'or', 'NotNull');
-  },
+  // Backbone Views are almost more convention than they are actual code. A View
+  // is simply a JavaScript object that represents a logical chunk of UI in the
+  // DOM. This might be a single item, an entire list, a sidebar or panel, or
+  // even the surrounding frame which wraps your whole app. Defining a chunk of
+  // UI as a **View** allows you to define your DOM events declaratively, without
+  // having to worry about render order ... and makes it easy for the view to
+  // react to specific changes in the state of your models.
 
-  // Adds a `where between` clause to the query.
-  whereBetween: function(column, values) {
-    this.wheres.push({column: column, type: 'Between', bool: 'and'});
-    push.apply(this.bindings, values);
-    return this;
-  },
+  // Creating a Backbone.View creates its initial element outside of the DOM,
+  // if an existing element is not provided...
+  var View = Backbone.View = function(options) {
+    this.cid = _.uniqueId('view');
+    options || (options = {});
+    _.extend(this, _.pick(options, viewOptions));
+    this._ensureElement();
+    this.initialize.apply(this, arguments);
+    this.delegateEvents();
+  };
 
-  // Adds a `or where between` clause to the query.
-  orWhereBetween: function(column, values) {
-    this.wheres.push({column: column, type: 'Between', bool: 'or'});
-    push.apply(this.bindings, values);
-    return this;
-  },
+  // Cached regex to split keys for `delegate`.
+  var delegateEventSplitter = /^(\S+)\s*(.*)$/;
 
-  // Adds a `group by` clause to the query.
-  groupBy: function() {
-    this.groups = (this.groups || []).concat(_.toArray(arguments));
-    return this;
-  },
+  // List of view options to be merged as properties.
+  var viewOptions = ['model', 'collection', 'el', 'id', 'attributes', 'className', 'tagName', 'events'];
 
-  // Adds a `order by` clause to the query.
-  orderBy: function(column, direction) {
-    if (!(direction instanceof Raw)) {
-      if (!_.contains(orderBys, (direction || '').toLowerCase())) direction = 'asc';
-    }
-    this.orders.push({column: column, direction: direction});
-    return this;
-  },
+  // Set up all inheritable **Backbone.View** properties and methods.
+  _.extend(View.prototype, Events, {
 
-  // Add a union statement to the query.
-  union: function(callback) {
-    this._union(callback, false);
-    return this;
-  },
+    // The default `tagName` of a View's element is `"div"`.
+    tagName: 'div',
 
-  // Adds a union all statement to the query.
-  unionAll: function(callback) {
-    this._union(callback, true);
-    return this;
-  },
+    // jQuery delegate for element lookup, scoped to DOM elements within the
+    // current view. This should be preferred to global lookups where possible.
+    $: function(selector) {
+      return this.$el.find(selector);
+    },
 
-  // Adds a `having` clause to the query.
-  having: function(column, operator, value, bool) {
-    if (column instanceof Raw) {
-      return this.havingRaw(column.sql, column.bindings, bool);
-    }
-    this.havings.push({column: column, operator: (operator || ''), value: (value || ''), bool: bool || 'and'});
-    this.bindings.push(value);
-    return this;
-  },
+    // Initialize is an empty function by default. Override it with your own
+    // initialization logic.
+    initialize: function(){},
 
-  // Adds an `or having` clause to the query.
-  orHaving: function(column, operator, value) {
-    return this.having(column, operator, value, 'or');
-  },
+    // **render** is the core function that your view should override, in order
+    // to populate its element (`this.el`), with the appropriate HTML. The
+    // convention is for **render** to always return `this`.
+    render: function() {
+      return this;
+    },
 
-  // Adds a raw `having` clause to the query.
-  havingRaw: function(sql, bindings, bool) {
-    bindings = _.isArray(bindings) ? bindings : (bindings ? [bindings] : []);
-    this.havings.push({type: 'Raw', sql: sql, bool: bool || 'and'});
-    push.apply(this.bindings, bindings);
-    return this;
-  },
+    // Remove this view by taking the element out of the DOM, and removing any
+    // applicable Backbone.Events listeners.
+    remove: function() {
+      this.$el.remove();
+      this.stopListening();
+      return this;
+    },
 
-  // Adds a raw `or having` clause to the query.
-  orHavingRaw: function(sql, bindings) {
-    return this.havingRaw(sql, bindings, 'or');
-  },
+    // Change the view's element (`this.el` property), including event
+    // re-delegation.
+    setElement: function(element, delegate) {
+      if (this.$el) this.undelegateEvents();
+      this.$el = element instanceof Backbone.$ ? element : Backbone.$(element);
+      this.el = this.$el[0];
+      if (delegate !== false) this.delegateEvents();
+      return this;
+    },
 
-  offset: function(value) {
-    if (arguments.length === 0) return this.flags.offset;
-    this.flags.offset = value;
-    return this;
-  },
+    // Set callbacks, where `this.events` is a hash of
+    //
+    // *{"event selector": "callback"}*
+    //
+    //     {
+    //       'mousedown .title':  'edit',
+    //       'click .button':     'save',
+    //       'click .open':       function(e) { ... }
+    //     }
+    //
+    // pairs. Callbacks will be bound to the view, with `this` set properly.
+    // Uses event delegation for efficiency.
+    // Omitting the selector binds the event to `this.el`.
+    // This only works for delegate-able events: not `focus`, `blur`, and
+    // not `change`, `submit`, and `reset` in Internet Explorer.
+    delegateEvents: function(events) {
+      if (!(events || (events = _.result(this, 'events')))) return this;
+      this.undelegateEvents();
+      for (var key in events) {
+        var method = events[key];
+        if (!_.isFunction(method)) method = this[events[key]];
+        if (!method) continue;
 
-  limit: function(value) {
-    if (arguments.length === 0) return this.flags.limit;
-    this.flags.limit = value;
-    return this;
-  },
+        var match = key.match(delegateEventSplitter);
+        var eventName = match[1], selector = match[2];
+        method = _.bind(method, this);
+        eventName += '.delegateEvents' + this.cid;
+        if (selector === '') {
+          this.$el.on(eventName, method);
+        } else {
+          this.$el.on(eventName, selector, method);
+        }
+      }
+      return this;
+    },
 
-  // Retrieve the "count" result of the query.
-  count: function(column) {
-    return this._aggregate('count', column);
-  },
+    // Clears all callbacks previously bound to the view with `delegateEvents`.
+    // You usually don't need to use this, but may wish to if you have multiple
+    // Backbone views attached to the same DOM element.
+    undelegateEvents: function() {
+      this.$el.off('.delegateEvents' + this.cid);
+      return this;
+    },
 
-  // Retrieve the minimum value of a given column.
-  min: function(column) {
-    return this._aggregate('min', column);
-  },
-
-  // Retrieve the maximum value of a given column.
-  max: function(column) {
-    return this._aggregate('max', column);
-  },
-
-  // Retrieve the sum of the values of a given column.
-  sum: function(column) {
-    return this._aggregate('sum', column);
-  },
-
-  // Retrieve the avg of the values of a given column.
-  avg: function(column) {
-    return this._aggregate('avg', column);
-  },
-
-  // Increments a column's value by the specified amount.
-  increment: function(column, amount) {
-    return this._counter(column, amount);
-  },
-
-  // Decrements a column's value by the specified amount.
-  decrement: function(column, amount) {
-    return this._counter(column, amount, '-');
-  },
-
-  // Sets the values for a `select` query.
-  select: function(columns) {
-    if (columns) {
-      push.apply(this.columns, _.isArray(columns) ? columns : _.toArray(arguments));
-    }
-    return this._setType('select');
-  },
-
-  // Sets the values for an `insert` query.
-  insert: function(values, returning) {
-    if (returning) this.returning(returning);
-    this.values = this.prepValues(_.clone(values));
-    return this._setType('insert');
-  },
-
-  // Sets the returning value for the query.
-  returning: function(returning) {
-    this.flags.returning = returning;
-    return this;
-  },
-
-  // Sets the values for an `update` query.
-  update: function(values, returning) {
-    if (returning) this.returning(returning);
-    var obj = Helpers.sortObject(values);
-    var bindings = [];
-    for (var i = 0, l = obj.length; i < l; i++) {
-      bindings[i] = obj[i][1];
-    }
-    this.bindings = bindings.concat(this.bindings || []);
-    this.values   = obj;
-    return this._setType('update');
-  },
-
-  // Alias to del.
-  "delete": function() {
-    return this._setType('delete');
-  },
-
-  // Executes a delete statement on the query;
-  del: function() {
-    return this._setType('delete');
-  },
-
-  option: function(opts) {
-    this.opts = _.extend(this.opts, opts);
-    return this;
-  },
-
-  // Truncate
-  truncate: function() {
-    return this._setType('truncate');
-  },
-
-  // Set by `transacting` - contains the object with the connection
-  // needed to execute a transaction
-  transaction: false,
-
-  // Preps the values for `insert` or `update`.
-  prepValues: function(values) {
-    if (!_.isArray(values)) values = values ? [values] : [];
-    for (var i = 0, l = values.length; i<l; i++) {
-      var obj = values[i] = Helpers.sortObject(values[i]);
-      for (var i2 = 0, l2 = obj.length; i2 < l2; i2++) {
-        this.bindings.push(obj[i2][1]);
+    // Ensure that the View has a DOM element to render into.
+    // If `this.el` is a string, pass it through `$()`, take the first
+    // matching element, and re-assign it to `el`. Otherwise, create
+    // an element from the `id`, `className` and `tagName` properties.
+    _ensureElement: function() {
+      if (!this.el) {
+        var attrs = _.extend({}, _.result(this, 'attributes'));
+        if (this.id) attrs.id = _.result(this, 'id');
+        if (this.className) attrs['class'] = _.result(this, 'className');
+        var $el = Backbone.$('<' + _.result(this, 'tagName') + '>').attr(attrs);
+        this.setElement($el, false);
+      } else {
+        this.setElement(_.result(this, 'el'), false);
       }
     }
-    return values;
-  },
 
-  // ----------------------------------------------------------------------
+  });
 
-  // Helper for compiling any advanced `where in` queries.
-  _whereInSub: function(column, callback, bool, condition) {
-    condition += 'Sub';
-    var query = new Builder(this.knex);
-    callback.call(query, query);
-    this.wheres.push({type: condition, column: column, query: query, bool: bool});
-    push.apply(this.bindings, query.bindings);
-    return this;
-  },
+  // Backbone.sync
+  // -------------
 
-  // Helper for compiling any advanced `where` queries.
-  _whereNested: function(callback, bool) {
-    var query = new Builder(this.knex);
-    callback.call(query, query);
-    this.wheres.push({type: 'Nested', query: query, bool: bool});
-    push.apply(this.bindings, query.bindings);
-    return this;
-  },
+  // Override this function to change the manner in which Backbone persists
+  // models to the server. You will be passed the type of request, and the
+  // model in question. By default, makes a RESTful Ajax request
+  // to the model's `url()`. Some possible customizations could be:
+  //
+  // * Use `setTimeout` to batch rapid-fire updates into a single request.
+  // * Send up the models as XML instead of JSON.
+  // * Persist models via WebSockets instead of Ajax.
+  //
+  // Turn on `Backbone.emulateHTTP` in order to send `PUT` and `DELETE` requests
+  // as `POST`, with a `_method` parameter containing the true HTTP method,
+  // as well as all requests with the body as `application/x-www-form-urlencoded`
+  // instead of `application/json` with the model in a param named `model`.
+  // Useful when interfacing with server-side languages like **PHP** that make
+  // it difficult to read the body of `PUT` requests.
+  Backbone.sync = function(method, model, options) {
+    var type = methodMap[method];
 
-  // Helper for compiling any of the `where` advanced queries.
-  _whereSub: function(column, operator, callback, bool) {
-    var query = new Builder(this.knex);
-    callback.call(query, query);
-    this.wheres.push({
-      type: 'Sub',
-      column: column,
-      operator: operator,
-      query: query,
-      bool: bool
+    // Default options, unless specified.
+    _.defaults(options || (options = {}), {
+      emulateHTTP: Backbone.emulateHTTP,
+      emulateJSON: Backbone.emulateJSON
     });
-    push.apply(this.bindings, query.bindings);
-    return this;
-  },
 
-  // Helper for compiling any aggregate queries.
-  _aggregate: function(type, columns) {
-    this.aggregates.push({type: type, columns: columns});
-    this.type && this.type === 'select' || this._setType('select');
-    return this;
-  },
+    // Default JSON-request options.
+    var params = {type: type, dataType: 'json'};
 
-  // Helper for the incrementing/decrementing queries.
-  _counter: function(column, amount, symbol) {
-    amount = parseInt(amount, 10);
-    if (isNaN(amount)) amount = 1;
-    var toUpdate = {};
-    toUpdate[column] = this.knex.raw(this.grammar.wrap(column) + ' ' + (symbol || '+') + ' ' + amount);
-    return this.update(toUpdate);
-  },
-
-  // Helper for compiling any `union` queries.
-  _union: function(callback, bool) {
-    var query = new Builder(this.knex);
-    callback.call(query, query);
-    this.unions.push({query: query, all: bool});
-    push.apply(this.bindings, query.bindings);
-  },
-
-  // Helper to pull a single column from each result and return array
-  pluck: function (column) {
-    if (!column) {
-      throw new Error('You must specify a column to pluck.');
+    // Ensure that we have a URL.
+    if (!options.url) {
+      params.url = _.result(model, 'url') || urlError();
     }
-    return this.column(column).then(function (results) {
-      return _.pluck(results, column);
-    });
-  },
 
-});
-
-exports.Builder = Builder;
-
-},{"./builder/joinclause":14,"./common":15,"./helpers":16,"./raw":18,"lodash":62}],14:[function(require,module,exports){
-// JoinClause
-// ---------
-
-// The "JoinClause" is an object holding any necessary info about a join,
-// including the type, and any associated tables & columns being joined.
-var JoinClause = function(type, table) {
-  this.joinType = type;
-  this.table    = table;
-  this.clauses  = [];
-};
-
-JoinClause.prototype = {
-
-  // Adds an "on" clause to the current join object.
-  on: function(first, operator, second) {
-    this.clauses.push({first: first, operator: operator, second: second, bool: 'and'});
-    return this;
-  },
-
-  // Adds an "and on" clause to the current join object.
-  andOn: function() {
-    return this.on.apply(this, arguments);
-  },
-
-  // Adds an "or on" clause to the current join object.
-  orOn: function(first, operator, second) {
-    this.clauses.push({first: first, operator: operator, second: second, bool: 'or'});
-    return this;
-  },
-
-  // Explicitly set the type of join, useful within a function when creating a grouped join.
-  type: function(type) {
-    this.joinType = type;
-    return this;
-  }
-
-};
-
-exports.JoinClause = JoinClause;
-
-},{}],15:[function(require,module,exports){
-// Common
-// -------
-
-// Some functions which are common to both the
-// `Builder` and `SchemaBuilder` classes.
-var _         = require('lodash');
-var Helpers   = require('./helpers').Helpers;
-var SqlString = require('./sqlstring').SqlString;
-
-var Promise   = require('./promise').Promise;
-
-var push      = [].push;
-
-// Methods common to both the `Grammar` and `SchemaGrammar` interfaces,
-// used to generate the sql in one form or another.
-exports.Common = {
-
-  // Creates a new instance of the current `Builder` or `SchemaBuilder`,
-  // with the correct current `knex` instance.
-  instance: function() {
-    var builder = new this.constructor(this.knex);
-        builder.table = this.table;
-    return builder;
-  },
-
-  // Sets the flag, so that when this object is passed into the
-  // client adapter, we know to `log` the query.
-  debug: function() {
-    this.flags.debug = true;
-    return this;
-  },
-
-  // Sets `options` which are passed along to the database client.
-  options: function(opts) {
-    this.flags.options = _.extend({}, this.flags.options, opts);
-    return this;
-  },
-
-  // For those who dislike promise interfaces.
-  // Multiple calls to `exec` will resolve with the same value
-  // if called more than once. Any unhandled errors will be thrown
-  // after the last block.
-  exec: function(callback) {
-    return this.then().nodeify(callback);
-  },
-
-  // The promise interface for the query builder.
-  then: function(onFulfilled, onRejected) {
-    if (!this._promise) {
-      this._promise = Promise.bind(this);
-      this._promise = this._promise.then(function() {
-        return this.client.query(this);
-      }).bind();
+    // Ensure that we have the appropriate request data.
+    if (options.data == null && model && (method === 'create' || method === 'update' || method === 'patch')) {
+      params.contentType = 'application/json';
+      params.data = JSON.stringify(options.attrs || model.toJSON(options));
     }
-    return this._promise.then(onFulfilled, onRejected);
-  },
 
-  map: function() {
-    var promise = this.then();
-    return promise.map.apply(promise, arguments);
-  },
-
-  reduce: function() {
-    var promise = this.then();
-    return promise.reduce.apply(promise, arguments);
-  },
-
-  catch: function() {
-    return this.caught.apply(this, arguments);
-  },
-
-  caught: function() {
-    var promise = this.then();
-    return promise.caught.apply(promise, arguments);
-  },
-
-  lastly: function() {
-    var promise = this.then();
-    return promise.lastly.apply(promise, arguments);
-  },
-
-  finally: function() {
-    return this.lastly.apply(this, arguments);
-  },
-
-  tap: function(handler) {
-    return this.then().tap(handler);
-  },
-
-  // Returns an array of query strings filled out with the
-  // correct values based on bindings, etc. Useful for debugging.
-  toString: function() {
-    // TODO: get rid of the need to clone the object here...
-    var builder = this, data = this.clone().toSql();
-    if (!_.isArray(data)) data = [data];
-    return _.map(data, function(str) {
-      return SqlString.format(str, builder.getBindings());
-    }).join('; ');
-  },
-
-  // Converts the current statement to a sql string
-  toSql: function() {
-    return this.grammar.toSql(this);
-  },
-
-  // Explicitly sets the connection.
-  connection: function(connection) {
-    this.usingConnection = connection;
-    return this;
-  },
-
-  // The connection the current query is being run on, optionally
-  // specified by the `connection` method.
-  usingConnection: false,
-
-  // Default handler for a response is to pass it along.
-  handleResponse: function(resp) {
-    if (this && this.grammar && this.grammar.handleResponse) {
-      return this.grammar.handleResponse(this, resp);
+    // For older servers, emulate JSON by encoding the request into an HTML-form.
+    if (options.emulateJSON) {
+      params.contentType = 'application/x-www-form-urlencoded';
+      params.data = params.data ? {model: params.data} : {};
     }
-    return resp;
-  },
 
-  // Sets the "type" of the current query, so we can potentially place
-  // `select`, `update`, `del`, etc. anywhere in the query statement
-  // and have it come out fine.
-  _setType: function(type) {
-    if (this.type) {
-      throw new Error('The query type has already been set to ' + this.type);
-    }
-    this.type = type;
-    return this;
-  },
-
-  // Returns all bindings excluding the `Knex.Raw` types.
-  getBindings: function() {
-    return this.grammar.getBindings(this);
-  },
-
-  // Sets the current Builder connection to that of the
-  // the currently running transaction
-  transacting: function(t) {
-    if (t) {
-      if (this.transaction) throw new Error('A transaction has already been set for the current query chain');
-      var flags = this.flags;
-      this.transaction = t;
-      this.usingConnection = t.connection;
-
-      // Add "forUpdate" and "forShare" here, since these are only relevant
-      // within the context of a transaction.
-      this.forUpdate = function() {
-        flags.selectMode = 'ForUpdate';
-      };
-      this.forShare = function() {
-        flags.selectMode = 'ForShare';
+    // For older servers, emulate HTTP by mimicking the HTTP method with `_method`
+    // And an `X-HTTP-Method-Override` header.
+    if (options.emulateHTTP && (type === 'PUT' || type === 'DELETE' || type === 'PATCH')) {
+      params.type = 'POST';
+      if (options.emulateJSON) params.data._method = type;
+      var beforeSend = options.beforeSend;
+      options.beforeSend = function(xhr) {
+        xhr.setRequestHeader('X-HTTP-Method-Override', type);
+        if (beforeSend) return beforeSend.apply(this, arguments);
       };
     }
-    return this;
-  }
 
-};
+    // Don't process data on a non-GET request.
+    if (params.type !== 'GET' && !options.emulateJSON) {
+      params.processData = false;
+    }
 
-},{"./helpers":16,"./promise":17,"./sqlstring":21,"lodash":62}],16:[function(require,module,exports){
-// Helpers
-// -------
+    // If we're sending a `PATCH` request, and we're in an old Internet Explorer
+    // that still has ActiveX enabled by default, override jQuery to use that
+    // for XHR instead. Remove this line when jQuery supports `PATCH` on IE8.
+    if (params.type === 'PATCH' && noXhrPatch) {
+      params.xhr = function() {
+        return new ActiveXObject("Microsoft.XMLHTTP");
+      };
+    }
 
-// Just some common functions needed in multiple places within the library.
-var _ = require('lodash');
+    // Make the request, allowing the user to override any Ajax options.
+    var xhr = options.xhr = Backbone.ajax(_.extend(params, options));
+    model.trigger('request', model, xhr, options);
+    return xhr;
+  };
 
-var Helpers = exports.Helpers = {
+  var noXhrPatch = typeof window !== 'undefined' && !!window.ActiveXObject && !(window.XMLHttpRequest && (new XMLHttpRequest).dispatchEvent);
 
-  // Simple deep clone for arrays & objects.
-  deepClone: function(obj) {
-    if (_.isObject(obj)) return _.cloneDeep(obj);
-    return obj;
-  },
+  // Map from CRUD to HTTP for our default `Backbone.sync` implementation.
+  var methodMap = {
+    'create': 'POST',
+    'update': 'PUT',
+    'patch':  'PATCH',
+    'delete': 'DELETE',
+    'read':   'GET'
+  };
 
-  // Pick off the attributes from only the current layer of the object.
-  skim: function(data) {
-    return _.map(data, function(obj) {
-      return _.pick(obj, _.keys(obj));
-    });
-  },
+  // Set the default implementation of `Backbone.ajax` to proxy through to `$`.
+  // Override this if you'd like to use a different library.
+  Backbone.ajax = function() {
+    return Backbone.$.ajax.apply(Backbone.$, arguments);
+  };
 
-  // The function name says it all.
-  capitalize: function(word) {
-    return word.charAt(0).toUpperCase() + word.slice(1);
-  },
+  // Backbone.Router
+  // ---------------
 
-  // Sorts an object based on the names.
-  sortObject: function(obj) {
-    return _.sortBy(_.pairs(obj), function(a) {
-      return a[0];
-    });
-  },
+  // Routers map faux-URLs to actions, and fire events when routes are
+  // matched. Creating a new one sets its `routes` hash, if not set statically.
+  var Router = Backbone.Router = function(options) {
+    options || (options = {});
+    if (options.routes) this.routes = options.routes;
+    this._bindRoutes();
+    this.initialize.apply(this, arguments);
+  };
 
-  // The standard Backbone.js `extend` method, for some nice
-  // "sugar" on proper prototypal inheritance.
-  extend: function(protoProps, staticProps) {
+  // Cached regular expressions for matching named param parts and splatted
+  // parts of route strings.
+  var optionalParam = /\((.*?)\)/g;
+  var namedParam    = /(\(\?)?:\w+/g;
+  var splatParam    = /\*\w+/g;
+  var escapeRegExp  = /[\-{}\[\]+?.,\\\^$|#\s]/g;
+
+  // Set up all inheritable **Backbone.Router** properties and methods.
+  _.extend(Router.prototype, Events, {
+
+    // Initialize is an empty function by default. Override it with your own
+    // initialization logic.
+    initialize: function(){},
+
+    // Manually bind a single named route to a callback. For example:
+    //
+    //     this.route('search/:query/p:num', 'search', function(query, num) {
+    //       ...
+    //     });
+    //
+    route: function(route, name, callback) {
+      if (!_.isRegExp(route)) route = this._routeToRegExp(route);
+      if (_.isFunction(name)) {
+        callback = name;
+        name = '';
+      }
+      if (!callback) callback = this[name];
+      var router = this;
+      Backbone.history.route(route, function(fragment) {
+        var args = router._extractParameters(route, fragment);
+        callback && callback.apply(router, args);
+        router.trigger.apply(router, ['route:' + name].concat(args));
+        router.trigger('route', name, args);
+        Backbone.history.trigger('route', router, name, args);
+      });
+      return this;
+    },
+
+    // Simple proxy to `Backbone.history` to save a fragment into the history.
+    navigate: function(fragment, options) {
+      Backbone.history.navigate(fragment, options);
+      return this;
+    },
+
+    // Bind all defined routes to `Backbone.history`. We have to reverse the
+    // order of the routes here to support behavior where the most general
+    // routes can be defined at the bottom of the route map.
+    _bindRoutes: function() {
+      if (!this.routes) return;
+      this.routes = _.result(this, 'routes');
+      var route, routes = _.keys(this.routes);
+      while ((route = routes.pop()) != null) {
+        this.route(route, this.routes[route]);
+      }
+    },
+
+    // Convert a route string into a regular expression, suitable for matching
+    // against the current location hash.
+    _routeToRegExp: function(route) {
+      route = route.replace(escapeRegExp, '\\$&')
+                   .replace(optionalParam, '(?:$1)?')
+                   .replace(namedParam, function(match, optional) {
+                     return optional ? match : '([^\/]+)';
+                   })
+                   .replace(splatParam, '(.*?)');
+      return new RegExp('^' + route + '$');
+    },
+
+    // Given a route, and a URL fragment that it matches, return the array of
+    // extracted decoded parameters. Empty or unmatched parameters will be
+    // treated as `null` to normalize cross-browser behavior.
+    _extractParameters: function(route, fragment) {
+      var params = route.exec(fragment).slice(1);
+      return _.map(params, function(param) {
+        return param ? decodeURIComponent(param) : null;
+      });
+    }
+
+  });
+
+  // Backbone.History
+  // ----------------
+
+  // Handles cross-browser history management, based on either
+  // [pushState](http://diveintohtml5.info/history.html) and real URLs, or
+  // [onhashchange](https://developer.mozilla.org/en-US/docs/DOM/window.onhashchange)
+  // and URL fragments. If the browser supports neither (old IE, natch),
+  // falls back to polling.
+  var History = Backbone.History = function() {
+    this.handlers = [];
+    _.bindAll(this, 'checkUrl');
+
+    // Ensure that `History` can be used outside of the browser.
+    if (typeof window !== 'undefined') {
+      this.location = window.location;
+      this.history = window.history;
+    }
+  };
+
+  // Cached regex for stripping a leading hash/slash and trailing space.
+  var routeStripper = /^[#\/]|\s+$/g;
+
+  // Cached regex for stripping leading and trailing slashes.
+  var rootStripper = /^\/+|\/+$/g;
+
+  // Cached regex for detecting MSIE.
+  var isExplorer = /msie [\w.]+/;
+
+  // Cached regex for removing a trailing slash.
+  var trailingSlash = /\/$/;
+
+  // Cached regex for stripping urls of hash and query.
+  var pathStripper = /[?#].*$/;
+
+  // Has the history handling already been started?
+  History.started = false;
+
+  // Set up all inheritable **Backbone.History** properties and methods.
+  _.extend(History.prototype, Events, {
+
+    // The default interval to poll for hash changes, if necessary, is
+    // twenty times a second.
+    interval: 50,
+
+    // Gets the true hash value. Cannot use location.hash directly due to bug
+    // in Firefox where location.hash will always be decoded.
+    getHash: function(window) {
+      var match = (window || this).location.href.match(/#(.*)$/);
+      return match ? match[1] : '';
+    },
+
+    // Get the cross-browser normalized URL fragment, either from the URL,
+    // the hash, or the override.
+    getFragment: function(fragment, forcePushState) {
+      if (fragment == null) {
+        if (this._hasPushState || !this._wantsHashChange || forcePushState) {
+          fragment = this.location.pathname;
+          var root = this.root.replace(trailingSlash, '');
+          if (!fragment.indexOf(root)) fragment = fragment.slice(root.length);
+        } else {
+          fragment = this.getHash();
+        }
+      }
+      return fragment.replace(routeStripper, '');
+    },
+
+    // Start the hash change handling, returning `true` if the current URL matches
+    // an existing route, and `false` otherwise.
+    start: function(options) {
+      if (History.started) throw new Error("Backbone.history has already been started");
+      History.started = true;
+
+      // Figure out the initial configuration. Do we need an iframe?
+      // Is pushState desired ... is it available?
+      this.options          = _.extend({root: '/'}, this.options, options);
+      this.root             = this.options.root;
+      this._wantsHashChange = this.options.hashChange !== false;
+      this._wantsPushState  = !!this.options.pushState;
+      this._hasPushState    = !!(this.options.pushState && this.history && this.history.pushState);
+      var fragment          = this.getFragment();
+      var docMode           = document.documentMode;
+      var oldIE             = (isExplorer.exec(navigator.userAgent.toLowerCase()) && (!docMode || docMode <= 7));
+
+      // Normalize root to always include a leading and trailing slash.
+      this.root = ('/' + this.root + '/').replace(rootStripper, '/');
+
+      if (oldIE && this._wantsHashChange) {
+        this.iframe = Backbone.$('<iframe src="javascript:0" tabindex="-1" />').hide().appendTo('body')[0].contentWindow;
+        this.navigate(fragment);
+      }
+
+      // Depending on whether we're using pushState or hashes, and whether
+      // 'onhashchange' is supported, determine how we check the URL state.
+      if (this._hasPushState) {
+        Backbone.$(window).on('popstate', this.checkUrl);
+      } else if (this._wantsHashChange && ('onhashchange' in window) && !oldIE) {
+        Backbone.$(window).on('hashchange', this.checkUrl);
+      } else if (this._wantsHashChange) {
+        this._checkUrlInterval = setInterval(this.checkUrl, this.interval);
+      }
+
+      // Determine if we need to change the base url, for a pushState link
+      // opened by a non-pushState browser.
+      this.fragment = fragment;
+      var loc = this.location;
+      var atRoot = loc.pathname.replace(/[^\/]$/, '$&/') === this.root;
+
+      // Transition from hashChange to pushState or vice versa if both are
+      // requested.
+      if (this._wantsHashChange && this._wantsPushState) {
+
+        // If we've started off with a route from a `pushState`-enabled
+        // browser, but we're currently in a browser that doesn't support it...
+        if (!this._hasPushState && !atRoot) {
+          this.fragment = this.getFragment(null, true);
+          this.location.replace(this.root + this.location.search + '#' + this.fragment);
+          // Return immediately as browser will do redirect to new url
+          return true;
+
+        // Or if we've started out with a hash-based route, but we're currently
+        // in a browser where it could be `pushState`-based instead...
+        } else if (this._hasPushState && atRoot && loc.hash) {
+          this.fragment = this.getHash().replace(routeStripper, '');
+          this.history.replaceState({}, document.title, this.root + this.fragment + loc.search);
+        }
+
+      }
+
+      if (!this.options.silent) return this.loadUrl();
+    },
+
+    // Disable Backbone.history, perhaps temporarily. Not useful in a real app,
+    // but possibly useful for unit testing Routers.
+    stop: function() {
+      Backbone.$(window).off('popstate', this.checkUrl).off('hashchange', this.checkUrl);
+      clearInterval(this._checkUrlInterval);
+      History.started = false;
+    },
+
+    // Add a route to be tested when the fragment changes. Routes added later
+    // may override previous routes.
+    route: function(route, callback) {
+      this.handlers.unshift({route: route, callback: callback});
+    },
+
+    // Checks the current URL to see if it has changed, and if it has,
+    // calls `loadUrl`, normalizing across the hidden iframe.
+    checkUrl: function(e) {
+      var current = this.getFragment();
+      if (current === this.fragment && this.iframe) {
+        current = this.getFragment(this.getHash(this.iframe));
+      }
+      if (current === this.fragment) return false;
+      if (this.iframe) this.navigate(current);
+      this.loadUrl();
+    },
+
+    // Attempt to load the current URL fragment. If a route succeeds with a
+    // match, returns `true`. If no defined routes matches the fragment,
+    // returns `false`.
+    loadUrl: function(fragment) {
+      fragment = this.fragment = this.getFragment(fragment);
+      return _.any(this.handlers, function(handler) {
+        if (handler.route.test(fragment)) {
+          handler.callback(fragment);
+          return true;
+        }
+      });
+    },
+
+    // Save a fragment into the hash history, or replace the URL state if the
+    // 'replace' option is passed. You are responsible for properly URL-encoding
+    // the fragment in advance.
+    //
+    // The options object can contain `trigger: true` if you wish to have the
+    // route callback be fired (not usually desirable), or `replace: true`, if
+    // you wish to modify the current URL without adding an entry to the history.
+    navigate: function(fragment, options) {
+      if (!History.started) return false;
+      if (!options || options === true) options = {trigger: !!options};
+
+      var url = this.root + (fragment = this.getFragment(fragment || ''));
+
+      // Strip the fragment of the query and hash for matching.
+      fragment = fragment.replace(pathStripper, '');
+
+      if (this.fragment === fragment) return;
+      this.fragment = fragment;
+
+      // Don't include a trailing slash on the root.
+      if (fragment === '' && url !== '/') url = url.slice(0, -1);
+
+      // If pushState is available, we use it to set the fragment as a real URL.
+      if (this._hasPushState) {
+        this.history[options.replace ? 'replaceState' : 'pushState']({}, document.title, url);
+
+      // If hash changes haven't been explicitly disabled, update the hash
+      // fragment to store history.
+      } else if (this._wantsHashChange) {
+        this._updateHash(this.location, fragment, options.replace);
+        if (this.iframe && (fragment !== this.getFragment(this.getHash(this.iframe)))) {
+          // Opening and closing the iframe tricks IE7 and earlier to push a
+          // history entry on hash-tag change.  When replace is true, we don't
+          // want this.
+          if(!options.replace) this.iframe.document.open().close();
+          this._updateHash(this.iframe.location, fragment, options.replace);
+        }
+
+      // If you've told us that you explicitly don't want fallback hashchange-
+      // based history, then `navigate` becomes a page refresh.
+      } else {
+        return this.location.assign(url);
+      }
+      if (options.trigger) return this.loadUrl(fragment);
+    },
+
+    // Update the hash location, either replacing the current entry, or adding
+    // a new one to the browser history.
+    _updateHash: function(location, fragment, replace) {
+      if (replace) {
+        var href = location.href.replace(/(javascript:|#).*$/, '');
+        location.replace(href + '#' + fragment);
+      } else {
+        // Some browsers require that `hash` contains a leading #.
+        location.hash = '#' + fragment;
+      }
+    }
+
+  });
+
+  // Create the default Backbone.history.
+  Backbone.history = new History;
+
+  // Helpers
+  // -------
+
+  // Helper function to correctly set up the prototype chain, for subclasses.
+  // Similar to `goog.inherits`, but uses a hash of prototype properties and
+  // class properties to be extended.
+  var extend = function(protoProps, staticProps) {
     var parent = this;
     var child;
 
@@ -2199,787 +3333,1373 @@ var Helpers = exports.Helpers = {
     child.__super__ = parent.prototype;
 
     return child;
-  },
+  };
 
-  // The `format` function is borrowed from the Node.js `utils` module,
-  // since we want to be able to have this functionality on the
-  // frontend as well.
-  format: function(f) {
-    var i;
-    if (!_.isString(f)) {
-      var objects = [];
-      for (i = 0; i < arguments.length; i++) {
-        objects.push(inspect(arguments[i]));
-      }
-      return objects.join(' ');
+  // Set up inheritance for the model, collection, router, view and history.
+  Model.extend = Collection.extend = Router.extend = View.extend = History.extend = extend;
+
+  // Throw an error when a URL is needed, and none is supplied.
+  var urlError = function() {
+    throw new Error('A "url" property or function must be specified');
+  };
+
+  // Wrap an optional error callback with a fallback error event.
+  var wrapError = function(model, options) {
+    var error = options.error;
+    options.error = function(resp) {
+      if (error) error(model, resp, options);
+      model.trigger('error', model, resp, options);
+    };
+  };
+
+}).call(this);
+
+},{"underscore":16}],16:[function(require,module,exports){
+//     Underscore.js 1.6.0
+//     http://underscorejs.org
+//     (c) 2009-2014 Jeremy Ashkenas, DocumentCloud and Investigative Reporters & Editors
+//     Underscore may be freely distributed under the MIT license.
+
+(function() {
+
+  // Baseline setup
+  // --------------
+
+  // Establish the root object, `window` in the browser, or `exports` on the server.
+  var root = this;
+
+  // Save the previous value of the `_` variable.
+  var previousUnderscore = root._;
+
+  // Establish the object that gets returned to break out of a loop iteration.
+  var breaker = {};
+
+  // Save bytes in the minified (but not gzipped) version:
+  var ArrayProto = Array.prototype, ObjProto = Object.prototype, FuncProto = Function.prototype;
+
+  // Create quick reference variables for speed access to core prototypes.
+  var
+    push             = ArrayProto.push,
+    slice            = ArrayProto.slice,
+    concat           = ArrayProto.concat,
+    toString         = ObjProto.toString,
+    hasOwnProperty   = ObjProto.hasOwnProperty;
+
+  // All **ECMAScript 5** native function implementations that we hope to use
+  // are declared here.
+  var
+    nativeForEach      = ArrayProto.forEach,
+    nativeMap          = ArrayProto.map,
+    nativeReduce       = ArrayProto.reduce,
+    nativeReduceRight  = ArrayProto.reduceRight,
+    nativeFilter       = ArrayProto.filter,
+    nativeEvery        = ArrayProto.every,
+    nativeSome         = ArrayProto.some,
+    nativeIndexOf      = ArrayProto.indexOf,
+    nativeLastIndexOf  = ArrayProto.lastIndexOf,
+    nativeIsArray      = Array.isArray,
+    nativeKeys         = Object.keys,
+    nativeBind         = FuncProto.bind;
+
+  // Create a safe reference to the Underscore object for use below.
+  var _ = function(obj) {
+    if (obj instanceof _) return obj;
+    if (!(this instanceof _)) return new _(obj);
+    this._wrapped = obj;
+  };
+
+  // Export the Underscore object for **Node.js**, with
+  // backwards-compatibility for the old `require()` API. If we're in
+  // the browser, add `_` as a global object via a string identifier,
+  // for Closure Compiler "advanced" mode.
+  if (typeof exports !== 'undefined') {
+    if (typeof module !== 'undefined' && module.exports) {
+      exports = module.exports = _;
     }
-    i = 1;
-    var args = arguments;
-    var len = args.length;
-    var str = String(f).replace(formatRegExp, function(x) {
-      if (x === '%%') return '%';
-      if (i >= len) return x;
-      switch (x) {
-        case '%s': return String(args[i++]);
-        case '%d': return Number(args[i++]);
-        case '%j':
-          try {
-            return JSON.stringify(args[i++]);
-          } catch (_) {
-            return '[Circular]';
-          }
-          break;
-        default:
-          return x;
+    exports._ = _;
+  } else {
+    root._ = _;
+  }
+
+  // Current version.
+  _.VERSION = '1.6.0';
+
+  // Collection Functions
+  // --------------------
+
+  // The cornerstone, an `each` implementation, aka `forEach`.
+  // Handles objects with the built-in `forEach`, arrays, and raw objects.
+  // Delegates to **ECMAScript 5**'s native `forEach` if available.
+  var each = _.each = _.forEach = function(obj, iterator, context) {
+    if (obj == null) return obj;
+    if (nativeForEach && obj.forEach === nativeForEach) {
+      obj.forEach(iterator, context);
+    } else if (obj.length === +obj.length) {
+      for (var i = 0, length = obj.length; i < length; i++) {
+        if (iterator.call(context, obj[i], i, obj) === breaker) return;
       }
+    } else {
+      var keys = _.keys(obj);
+      for (var i = 0, length = keys.length; i < length; i++) {
+        if (iterator.call(context, obj[keys[i]], keys[i], obj) === breaker) return;
+      }
+    }
+    return obj;
+  };
+
+  // Return the results of applying the iterator to each element.
+  // Delegates to **ECMAScript 5**'s native `map` if available.
+  _.map = _.collect = function(obj, iterator, context) {
+    var results = [];
+    if (obj == null) return results;
+    if (nativeMap && obj.map === nativeMap) return obj.map(iterator, context);
+    each(obj, function(value, index, list) {
+      results.push(iterator.call(context, value, index, list));
     });
-    for (var x = args[i]; i < len; x = args[++i]) {
-      if (_.isNull(x) || !_.isObject(x)) {
-        str += ' ' + x;
+    return results;
+  };
+
+  var reduceError = 'Reduce of empty array with no initial value';
+
+  // **Reduce** builds up a single result from a list of values, aka `inject`,
+  // or `foldl`. Delegates to **ECMAScript 5**'s native `reduce` if available.
+  _.reduce = _.foldl = _.inject = function(obj, iterator, memo, context) {
+    var initial = arguments.length > 2;
+    if (obj == null) obj = [];
+    if (nativeReduce && obj.reduce === nativeReduce) {
+      if (context) iterator = _.bind(iterator, context);
+      return initial ? obj.reduce(iterator, memo) : obj.reduce(iterator);
+    }
+    each(obj, function(value, index, list) {
+      if (!initial) {
+        memo = value;
+        initial = true;
       } else {
-        str += ' ' + inspect(x);
+        memo = iterator.call(context, memo, value, index, list);
+      }
+    });
+    if (!initial) throw new TypeError(reduceError);
+    return memo;
+  };
+
+  // The right-associative version of reduce, also known as `foldr`.
+  // Delegates to **ECMAScript 5**'s native `reduceRight` if available.
+  _.reduceRight = _.foldr = function(obj, iterator, memo, context) {
+    var initial = arguments.length > 2;
+    if (obj == null) obj = [];
+    if (nativeReduceRight && obj.reduceRight === nativeReduceRight) {
+      if (context) iterator = _.bind(iterator, context);
+      return initial ? obj.reduceRight(iterator, memo) : obj.reduceRight(iterator);
+    }
+    var length = obj.length;
+    if (length !== +length) {
+      var keys = _.keys(obj);
+      length = keys.length;
+    }
+    each(obj, function(value, index, list) {
+      index = keys ? keys[--length] : --length;
+      if (!initial) {
+        memo = obj[index];
+        initial = true;
+      } else {
+        memo = iterator.call(context, memo, obj[index], index, list);
+      }
+    });
+    if (!initial) throw new TypeError(reduceError);
+    return memo;
+  };
+
+  // Return the first value which passes a truth test. Aliased as `detect`.
+  _.find = _.detect = function(obj, predicate, context) {
+    var result;
+    any(obj, function(value, index, list) {
+      if (predicate.call(context, value, index, list)) {
+        result = value;
+        return true;
+      }
+    });
+    return result;
+  };
+
+  // Return all the elements that pass a truth test.
+  // Delegates to **ECMAScript 5**'s native `filter` if available.
+  // Aliased as `select`.
+  _.filter = _.select = function(obj, predicate, context) {
+    var results = [];
+    if (obj == null) return results;
+    if (nativeFilter && obj.filter === nativeFilter) return obj.filter(predicate, context);
+    each(obj, function(value, index, list) {
+      if (predicate.call(context, value, index, list)) results.push(value);
+    });
+    return results;
+  };
+
+  // Return all the elements for which a truth test fails.
+  _.reject = function(obj, predicate, context) {
+    return _.filter(obj, function(value, index, list) {
+      return !predicate.call(context, value, index, list);
+    }, context);
+  };
+
+  // Determine whether all of the elements match a truth test.
+  // Delegates to **ECMAScript 5**'s native `every` if available.
+  // Aliased as `all`.
+  _.every = _.all = function(obj, predicate, context) {
+    predicate || (predicate = _.identity);
+    var result = true;
+    if (obj == null) return result;
+    if (nativeEvery && obj.every === nativeEvery) return obj.every(predicate, context);
+    each(obj, function(value, index, list) {
+      if (!(result = result && predicate.call(context, value, index, list))) return breaker;
+    });
+    return !!result;
+  };
+
+  // Determine if at least one element in the object matches a truth test.
+  // Delegates to **ECMAScript 5**'s native `some` if available.
+  // Aliased as `any`.
+  var any = _.some = _.any = function(obj, predicate, context) {
+    predicate || (predicate = _.identity);
+    var result = false;
+    if (obj == null) return result;
+    if (nativeSome && obj.some === nativeSome) return obj.some(predicate, context);
+    each(obj, function(value, index, list) {
+      if (result || (result = predicate.call(context, value, index, list))) return breaker;
+    });
+    return !!result;
+  };
+
+  // Determine if the array or object contains a given value (using `===`).
+  // Aliased as `include`.
+  _.contains = _.include = function(obj, target) {
+    if (obj == null) return false;
+    if (nativeIndexOf && obj.indexOf === nativeIndexOf) return obj.indexOf(target) != -1;
+    return any(obj, function(value) {
+      return value === target;
+    });
+  };
+
+  // Invoke a method (with arguments) on every item in a collection.
+  _.invoke = function(obj, method) {
+    var args = slice.call(arguments, 2);
+    var isFunc = _.isFunction(method);
+    return _.map(obj, function(value) {
+      return (isFunc ? method : value[method]).apply(value, args);
+    });
+  };
+
+  // Convenience version of a common use case of `map`: fetching a property.
+  _.pluck = function(obj, key) {
+    return _.map(obj, _.property(key));
+  };
+
+  // Convenience version of a common use case of `filter`: selecting only objects
+  // containing specific `key:value` pairs.
+  _.where = function(obj, attrs) {
+    return _.filter(obj, _.matches(attrs));
+  };
+
+  // Convenience version of a common use case of `find`: getting the first object
+  // containing specific `key:value` pairs.
+  _.findWhere = function(obj, attrs) {
+    return _.find(obj, _.matches(attrs));
+  };
+
+  // Return the maximum element or (element-based computation).
+  // Can't optimize arrays of integers longer than 65,535 elements.
+  // See [WebKit Bug 80797](https://bugs.webkit.org/show_bug.cgi?id=80797)
+  _.max = function(obj, iterator, context) {
+    if (!iterator && _.isArray(obj) && obj[0] === +obj[0] && obj.length < 65535) {
+      return Math.max.apply(Math, obj);
+    }
+    var result = -Infinity, lastComputed = -Infinity;
+    each(obj, function(value, index, list) {
+      var computed = iterator ? iterator.call(context, value, index, list) : value;
+      if (computed > lastComputed) {
+        result = value;
+        lastComputed = computed;
+      }
+    });
+    return result;
+  };
+
+  // Return the minimum element (or element-based computation).
+  _.min = function(obj, iterator, context) {
+    if (!iterator && _.isArray(obj) && obj[0] === +obj[0] && obj.length < 65535) {
+      return Math.min.apply(Math, obj);
+    }
+    var result = Infinity, lastComputed = Infinity;
+    each(obj, function(value, index, list) {
+      var computed = iterator ? iterator.call(context, value, index, list) : value;
+      if (computed < lastComputed) {
+        result = value;
+        lastComputed = computed;
+      }
+    });
+    return result;
+  };
+
+  // Shuffle an array, using the modern version of the
+  // [Fisher-Yates shuffle](http://en.wikipedia.org/wiki/Fisher–Yates_shuffle).
+  _.shuffle = function(obj) {
+    var rand;
+    var index = 0;
+    var shuffled = [];
+    each(obj, function(value) {
+      rand = _.random(index++);
+      shuffled[index - 1] = shuffled[rand];
+      shuffled[rand] = value;
+    });
+    return shuffled;
+  };
+
+  // Sample **n** random values from a collection.
+  // If **n** is not specified, returns a single random element.
+  // The internal `guard` argument allows it to work with `map`.
+  _.sample = function(obj, n, guard) {
+    if (n == null || guard) {
+      if (obj.length !== +obj.length) obj = _.values(obj);
+      return obj[_.random(obj.length - 1)];
+    }
+    return _.shuffle(obj).slice(0, Math.max(0, n));
+  };
+
+  // An internal function to generate lookup iterators.
+  var lookupIterator = function(value) {
+    if (value == null) return _.identity;
+    if (_.isFunction(value)) return value;
+    return _.property(value);
+  };
+
+  // Sort the object's values by a criterion produced by an iterator.
+  _.sortBy = function(obj, iterator, context) {
+    iterator = lookupIterator(iterator);
+    return _.pluck(_.map(obj, function(value, index, list) {
+      return {
+        value: value,
+        index: index,
+        criteria: iterator.call(context, value, index, list)
+      };
+    }).sort(function(left, right) {
+      var a = left.criteria;
+      var b = right.criteria;
+      if (a !== b) {
+        if (a > b || a === void 0) return 1;
+        if (a < b || b === void 0) return -1;
+      }
+      return left.index - right.index;
+    }), 'value');
+  };
+
+  // An internal function used for aggregate "group by" operations.
+  var group = function(behavior) {
+    return function(obj, iterator, context) {
+      var result = {};
+      iterator = lookupIterator(iterator);
+      each(obj, function(value, index) {
+        var key = iterator.call(context, value, index, obj);
+        behavior(result, key, value);
+      });
+      return result;
+    };
+  };
+
+  // Groups the object's values by a criterion. Pass either a string attribute
+  // to group by, or a function that returns the criterion.
+  _.groupBy = group(function(result, key, value) {
+    _.has(result, key) ? result[key].push(value) : result[key] = [value];
+  });
+
+  // Indexes the object's values by a criterion, similar to `groupBy`, but for
+  // when you know that your index values will be unique.
+  _.indexBy = group(function(result, key, value) {
+    result[key] = value;
+  });
+
+  // Counts instances of an object that group by a certain criterion. Pass
+  // either a string attribute to count by, or a function that returns the
+  // criterion.
+  _.countBy = group(function(result, key) {
+    _.has(result, key) ? result[key]++ : result[key] = 1;
+  });
+
+  // Use a comparator function to figure out the smallest index at which
+  // an object should be inserted so as to maintain order. Uses binary search.
+  _.sortedIndex = function(array, obj, iterator, context) {
+    iterator = lookupIterator(iterator);
+    var value = iterator.call(context, obj);
+    var low = 0, high = array.length;
+    while (low < high) {
+      var mid = (low + high) >>> 1;
+      iterator.call(context, array[mid]) < value ? low = mid + 1 : high = mid;
+    }
+    return low;
+  };
+
+  // Safely create a real, live array from anything iterable.
+  _.toArray = function(obj) {
+    if (!obj) return [];
+    if (_.isArray(obj)) return slice.call(obj);
+    if (obj.length === +obj.length) return _.map(obj, _.identity);
+    return _.values(obj);
+  };
+
+  // Return the number of elements in an object.
+  _.size = function(obj) {
+    if (obj == null) return 0;
+    return (obj.length === +obj.length) ? obj.length : _.keys(obj).length;
+  };
+
+  // Array Functions
+  // ---------------
+
+  // Get the first element of an array. Passing **n** will return the first N
+  // values in the array. Aliased as `head` and `take`. The **guard** check
+  // allows it to work with `_.map`.
+  _.first = _.head = _.take = function(array, n, guard) {
+    if (array == null) return void 0;
+    if ((n == null) || guard) return array[0];
+    if (n < 0) return [];
+    return slice.call(array, 0, n);
+  };
+
+  // Returns everything but the last entry of the array. Especially useful on
+  // the arguments object. Passing **n** will return all the values in
+  // the array, excluding the last N. The **guard** check allows it to work with
+  // `_.map`.
+  _.initial = function(array, n, guard) {
+    return slice.call(array, 0, array.length - ((n == null) || guard ? 1 : n));
+  };
+
+  // Get the last element of an array. Passing **n** will return the last N
+  // values in the array. The **guard** check allows it to work with `_.map`.
+  _.last = function(array, n, guard) {
+    if (array == null) return void 0;
+    if ((n == null) || guard) return array[array.length - 1];
+    return slice.call(array, Math.max(array.length - n, 0));
+  };
+
+  // Returns everything but the first entry of the array. Aliased as `tail` and `drop`.
+  // Especially useful on the arguments object. Passing an **n** will return
+  // the rest N values in the array. The **guard**
+  // check allows it to work with `_.map`.
+  _.rest = _.tail = _.drop = function(array, n, guard) {
+    return slice.call(array, (n == null) || guard ? 1 : n);
+  };
+
+  // Trim out all falsy values from an array.
+  _.compact = function(array) {
+    return _.filter(array, _.identity);
+  };
+
+  // Internal implementation of a recursive `flatten` function.
+  var flatten = function(input, shallow, output) {
+    if (shallow && _.every(input, _.isArray)) {
+      return concat.apply(output, input);
+    }
+    each(input, function(value) {
+      if (_.isArray(value) || _.isArguments(value)) {
+        shallow ? push.apply(output, value) : flatten(value, shallow, output);
+      } else {
+        output.push(value);
+      }
+    });
+    return output;
+  };
+
+  // Flatten out an array, either recursively (by default), or just one level.
+  _.flatten = function(array, shallow) {
+    return flatten(array, shallow, []);
+  };
+
+  // Return a version of the array that does not contain the specified value(s).
+  _.without = function(array) {
+    return _.difference(array, slice.call(arguments, 1));
+  };
+
+  // Split an array into two arrays: one whose elements all satisfy the given
+  // predicate, and one whose elements all do not satisfy the predicate.
+  _.partition = function(array, predicate) {
+    var pass = [], fail = [];
+    each(array, function(elem) {
+      (predicate(elem) ? pass : fail).push(elem);
+    });
+    return [pass, fail];
+  };
+
+  // Produce a duplicate-free version of the array. If the array has already
+  // been sorted, you have the option of using a faster algorithm.
+  // Aliased as `unique`.
+  _.uniq = _.unique = function(array, isSorted, iterator, context) {
+    if (_.isFunction(isSorted)) {
+      context = iterator;
+      iterator = isSorted;
+      isSorted = false;
+    }
+    var initial = iterator ? _.map(array, iterator, context) : array;
+    var results = [];
+    var seen = [];
+    each(initial, function(value, index) {
+      if (isSorted ? (!index || seen[seen.length - 1] !== value) : !_.contains(seen, value)) {
+        seen.push(value);
+        results.push(array[index]);
+      }
+    });
+    return results;
+  };
+
+  // Produce an array that contains the union: each distinct element from all of
+  // the passed-in arrays.
+  _.union = function() {
+    return _.uniq(_.flatten(arguments, true));
+  };
+
+  // Produce an array that contains every item shared between all the
+  // passed-in arrays.
+  _.intersection = function(array) {
+    var rest = slice.call(arguments, 1);
+    return _.filter(_.uniq(array), function(item) {
+      return _.every(rest, function(other) {
+        return _.contains(other, item);
+      });
+    });
+  };
+
+  // Take the difference between one array and a number of other arrays.
+  // Only the elements present in just the first array will remain.
+  _.difference = function(array) {
+    var rest = concat.apply(ArrayProto, slice.call(arguments, 1));
+    return _.filter(array, function(value){ return !_.contains(rest, value); });
+  };
+
+  // Zip together multiple lists into a single array -- elements that share
+  // an index go together.
+  _.zip = function() {
+    var length = _.max(_.pluck(arguments, 'length').concat(0));
+    var results = new Array(length);
+    for (var i = 0; i < length; i++) {
+      results[i] = _.pluck(arguments, '' + i);
+    }
+    return results;
+  };
+
+  // Converts lists into objects. Pass either a single array of `[key, value]`
+  // pairs, or two parallel arrays of the same length -- one of keys, and one of
+  // the corresponding values.
+  _.object = function(list, values) {
+    if (list == null) return {};
+    var result = {};
+    for (var i = 0, length = list.length; i < length; i++) {
+      if (values) {
+        result[list[i]] = values[i];
+      } else {
+        result[list[i][0]] = list[i][1];
       }
     }
-    return str;
-  }
+    return result;
+  };
 
-};
+  // If the browser doesn't supply us with indexOf (I'm looking at you, **MSIE**),
+  // we need this function. Return the position of the first occurrence of an
+  // item in an array, or -1 if the item is not included in the array.
+  // Delegates to **ECMAScript 5**'s native `indexOf` if available.
+  // If the array is large and already in sort order, pass `true`
+  // for **isSorted** to use binary search.
+  _.indexOf = function(array, item, isSorted) {
+    if (array == null) return -1;
+    var i = 0, length = array.length;
+    if (isSorted) {
+      if (typeof isSorted == 'number') {
+        i = (isSorted < 0 ? Math.max(0, length + isSorted) : isSorted);
+      } else {
+        i = _.sortedIndex(array, item);
+        return array[i] === item ? i : -1;
+      }
+    }
+    if (nativeIndexOf && array.indexOf === nativeIndexOf) return array.indexOf(item, isSorted);
+    for (; i < length; i++) if (array[i] === item) return i;
+    return -1;
+  };
 
-// Regex used in the `Helpers.format` function.
-var formatRegExp = /%[sdj%]/g;
+  // Delegates to **ECMAScript 5**'s native `lastIndexOf` if available.
+  _.lastIndexOf = function(array, item, from) {
+    if (array == null) return -1;
+    var hasIndex = from != null;
+    if (nativeLastIndexOf && array.lastIndexOf === nativeLastIndexOf) {
+      return hasIndex ? array.lastIndexOf(item, from) : array.lastIndexOf(item);
+    }
+    var i = (hasIndex ? from : array.length);
+    while (i--) if (array[i] === item) return i;
+    return -1;
+  };
 
-},{"lodash":62}],17:[function(require,module,exports){
+  // Generate an integer Array containing an arithmetic progression. A port of
+  // the native Python `range()` function. See
+  // [the Python documentation](http://docs.python.org/library/functions.html#range).
+  _.range = function(start, stop, step) {
+    if (arguments.length <= 1) {
+      stop = start || 0;
+      start = 0;
+    }
+    step = arguments[2] || 1;
 
-var Promise = require('bluebird/js/main/promise')();
+    var length = Math.max(Math.ceil((stop - start) / step), 0);
+    var idx = 0;
+    var range = new Array(length);
 
-Promise.prototype.yield = function(value) {
-  return this.then(function() {
-    return value;
-  });
-};
+    while(idx < length) {
+      range[idx++] = start;
+      start += step;
+    }
 
-Promise.prototype.tap = function(handler) {
-  return this.then(handler).yield(this);
-};
+    return range;
+  };
 
-Promise.prototype.ensure = Promise.prototype.lastly;
-Promise.prototype.otherwise = Promise.prototype.caught;
+  // Function (ahem) Functions
+  // ------------------
 
-Promise.resolve = Promise.fulfilled;
-Promise.reject  = Promise.rejected;
+  // Reusable constructor function for prototype setting.
+  var ctor = function(){};
 
-exports.Promise = Promise;
+  // Create a function bound to a given object (assigning `this`, and arguments,
+  // optionally). Delegates to **ECMAScript 5**'s native `Function.bind` if
+  // available.
+  _.bind = function(func, context) {
+    var args, bound;
+    if (nativeBind && func.bind === nativeBind) return nativeBind.apply(func, slice.call(arguments, 1));
+    if (!_.isFunction(func)) throw new TypeError;
+    args = slice.call(arguments, 2);
+    return bound = function() {
+      if (!(this instanceof bound)) return func.apply(context, args.concat(slice.call(arguments)));
+      ctor.prototype = func.prototype;
+      var self = new ctor;
+      ctor.prototype = null;
+      var result = func.apply(self, args.concat(slice.call(arguments)));
+      if (Object(result) === result) return result;
+      return self;
+    };
+  };
 
-},{"bluebird/js/main/promise":41}],18:[function(require,module,exports){
-// Raw
-// -------
-var _ = require('lodash');
+  // Partially apply a function by creating a version that has had some of its
+  // arguments pre-filled, without changing its dynamic `this` context. _ acts
+  // as a placeholder, allowing any combination of arguments to be pre-filled.
+  _.partial = function(func) {
+    var boundArgs = slice.call(arguments, 1);
+    return function() {
+      var position = 0;
+      var args = boundArgs.slice();
+      for (var i = 0, length = args.length; i < length; i++) {
+        if (args[i] === _) args[i] = arguments[position++];
+      }
+      while (position < arguments.length) args.push(arguments[position++]);
+      return func.apply(this, args);
+    };
+  };
 
-var Common  = require('./common').Common;
+  // Bind a number of an object's methods to that object. Remaining arguments
+  // are the method names to be bound. Useful for ensuring that all callbacks
+  // defined on an object belong to it.
+  _.bindAll = function(obj) {
+    var funcs = slice.call(arguments, 1);
+    if (funcs.length === 0) throw new Error('bindAll must be passed function names');
+    each(funcs, function(f) { obj[f] = _.bind(obj[f], obj); });
+    return obj;
+  };
 
-var Raw = function(instance) {
-  this.knex   = instance;
-  this.client = instance.client;
-  this.flags  = {};
-};
+  // Memoize an expensive function by storing its results.
+  _.memoize = function(func, hasher) {
+    var memo = {};
+    hasher || (hasher = _.identity);
+    return function() {
+      var key = hasher.apply(this, arguments);
+      return _.has(memo, key) ? memo[key] : (memo[key] = func.apply(this, arguments));
+    };
+  };
 
-_.extend(Raw.prototype, Common, {
+  // Delays a function for the given number of milliseconds, and then calls
+  // it with the arguments supplied.
+  _.delay = function(func, wait) {
+    var args = slice.call(arguments, 2);
+    return setTimeout(function(){ return func.apply(null, args); }, wait);
+  };
 
-  _source: 'Raw',
+  // Defers a function, scheduling it to run after the current call stack has
+  // cleared.
+  _.defer = function(func) {
+    return _.delay.apply(_, [func, 1].concat(slice.call(arguments, 1)));
+  };
 
-  // Set the sql and the bindings associated with the query, returning
-  // the current raw object.
-  query: function(sql, bindings) {
-    this.bindings = _.isArray(bindings) ? bindings :
-      bindings ? [bindings] : [];
-    this.sql = sql;
-    return this;
-  },
+  // Returns a function, that, when invoked, will only be triggered at most once
+  // during a given window of time. Normally, the throttled function will run
+  // as much as it can, without ever going more than once per `wait` duration;
+  // but if you'd like to disable the execution on the leading edge, pass
+  // `{leading: false}`. To disable execution on the trailing edge, ditto.
+  _.throttle = function(func, wait, options) {
+    var context, args, result;
+    var timeout = null;
+    var previous = 0;
+    options || (options = {});
+    var later = function() {
+      previous = options.leading === false ? 0 : _.now();
+      timeout = null;
+      result = func.apply(context, args);
+      context = args = null;
+    };
+    return function() {
+      var now = _.now();
+      if (!previous && options.leading === false) previous = now;
+      var remaining = wait - (now - previous);
+      context = this;
+      args = arguments;
+      if (remaining <= 0) {
+        clearTimeout(timeout);
+        timeout = null;
+        previous = now;
+        result = func.apply(context, args);
+        context = args = null;
+      } else if (!timeout && options.trailing !== false) {
+        timeout = setTimeout(later, remaining);
+      }
+      return result;
+    };
+  };
 
-  // Returns the raw sql for the query.
-  toSql: function() {
-    return this.sql;
-  },
+  // Returns a function, that, as long as it continues to be invoked, will not
+  // be triggered. The function will be called after it stops being called for
+  // N milliseconds. If `immediate` is passed, trigger the function on the
+  // leading edge, instead of the trailing.
+  _.debounce = function(func, wait, immediate) {
+    var timeout, args, context, timestamp, result;
 
-  // Returns the cleaned bindings for the current raw query.
-  getBindings: function() {
-    return this.client.grammar.getBindings(this);
-  }
+    var later = function() {
+      var last = _.now() - timestamp;
+      if (last < wait) {
+        timeout = setTimeout(later, wait - last);
+      } else {
+        timeout = null;
+        if (!immediate) {
+          result = func.apply(context, args);
+          context = args = null;
+        }
+      }
+    };
 
-});
+    return function() {
+      context = this;
+      args = arguments;
+      timestamp = _.now();
+      var callNow = immediate && !timeout;
+      if (!timeout) {
+        timeout = setTimeout(later, wait);
+      }
+      if (callNow) {
+        result = func.apply(context, args);
+        context = args = null;
+      }
 
-exports.Raw = Raw;
+      return result;
+    };
+  };
 
-},{"./common":15,"lodash":62}],19:[function(require,module,exports){
-// Schema Builder
-// -------
-var _       = require('lodash');
-
-var Common  = require('./common').Common;
-var Helpers = require('./helpers').Helpers;
-var Raw     = require('./raw').Raw;
-
-var SchemaBuilder = function(knex) {
-  this.knex     = knex;
-  this.client   = knex.client;
-  this.grammar  = knex.schemaGrammar;
-  this.columns  = [];
-  this.commands = [];
-  this.bindings = [];
-  this.flags    = {};
-  _.bindAll(this, 'handleResponse');
-};
-
-var toClone = ['columns', 'commands', 'bindings', 'flags'];
-
-_.extend(SchemaBuilder.prototype, Common, {
-
-  _source: 'SchemaBuilder',
-
-  clone: function() {
-    return _.reduce(toClone, function(memo, key) {
-      memo[key] = Helpers.deepClone(this[key]);
+  // Returns a function that will be executed at most one time, no matter how
+  // often you call it. Useful for lazy initialization.
+  _.once = function(func) {
+    var ran = false, memo;
+    return function() {
+      if (ran) return memo;
+      ran = true;
+      memo = func.apply(this, arguments);
+      func = null;
       return memo;
-    }, this.instance(), this);
-  },
+    };
+  };
 
-  // A callback from the table building `Knex.schemaBuilder` calls.
-  callback: function(callback) {
-    if (callback) callback.call(this, this);
-    return this;
-  },
+  // Returns the first function passed as an argument to the second,
+  // allowing you to adjust arguments, run code before and after, and
+  // conditionally execute the original function.
+  _.wrap = function(func, wrapper) {
+    return _.partial(wrapper, func);
+  };
 
-  // Determine if the blueprint has a create command.
-  creating: function() {
-    for (var i = 0, l = this.commands.length; i < l; i++) {
-      if (this.commands[i].name == 'createTable') return true;
+  // Returns a function that is the composition of a list of functions, each
+  // consuming the return value of the function that follows.
+  _.compose = function() {
+    var funcs = arguments;
+    return function() {
+      var args = arguments;
+      for (var i = funcs.length - 1; i >= 0; i--) {
+        args = [funcs[i].apply(this, args)];
+      }
+      return args[0];
+    };
+  };
+
+  // Returns a function that will only be executed after being called N times.
+  _.after = function(times, func) {
+    return function() {
+      if (--times < 1) {
+        return func.apply(this, arguments);
+      }
+    };
+  };
+
+  // Object Functions
+  // ----------------
+
+  // Retrieve the names of an object's properties.
+  // Delegates to **ECMAScript 5**'s native `Object.keys`
+  _.keys = function(obj) {
+    if (!_.isObject(obj)) return [];
+    if (nativeKeys) return nativeKeys(obj);
+    var keys = [];
+    for (var key in obj) if (_.has(obj, key)) keys.push(key);
+    return keys;
+  };
+
+  // Retrieve the values of an object's properties.
+  _.values = function(obj) {
+    var keys = _.keys(obj);
+    var length = keys.length;
+    var values = new Array(length);
+    for (var i = 0; i < length; i++) {
+      values[i] = obj[keys[i]];
     }
-    return false;
-  },
+    return values;
+  };
 
-  // Sets the engine to use when creating the table in MySql
-  engine: function(name) {
-    if (!this.creating()) throw new Error('The `engine` modifier may only be used while creating a table.');
-    this.flags.engine = name;
-    return this;
-  },
-
-  // Sets the character set for the table in MySql
-  charset: function(charset) {
-    if (!this.creating()) throw new Error('The `engine` modifier may only be used while creating a table.');
-    this.flags.charset = charset;
-    return this;
-  },
-
-  // Sets the collation for the table in MySql
-  collate: function(collation) {
-    if (!this.creating()) throw new Error('The `engine` modifier may only be used while creating a table.');
-    this.flags.collation = collation;
-    return this;
-  },
-
-  // Adds a comment to the current table being created.
-  comment: function(comment) {
-    return this._addCommand('comment', {comment: comment});
-  },
-
-  // Indicate that the given columns should be dropped.
-  dropColumn: function(columns) {
-    if (!_.isArray(columns)) columns = columns ? [columns] : [];
-    return this._addCommand('dropColumn', {columns: columns});
-  },
-
-  // Indicate that the given columns should be dropped.
-  dropColumns: function() {
-    return this.dropColumn(arguments);
-  },
-
-  // Indicate that the given primary key should be dropped.
-  dropPrimary: function(index) {
-    return this._dropIndexCommand('dropPrimary', index);
-  },
-
-  // Indicate that the given unique key should be dropped.
-  dropUnique: function(index) {
-    return this._dropIndexCommand('dropUnique', index);
-  },
-
-  // Indicate that the given index should be dropped.
-  dropIndex: function(index) {
-    return this._dropIndexCommand('dropIndex', index);
-  },
-
-  // Indicate that the given foreign key should be dropped.
-  dropForeign: function(index) {
-    return this._dropIndexCommand('dropForeign', index);
-  },
-
-  // Specify the primary key(s) for the table.
-  primary: function(columns, name) {
-    return this._indexCommand('primary', columns, name);
-  },
-
-  // Specify a unique index for the table.
-  unique: function(columns, name) {
-    return this._indexCommand('unique', columns, name);
-  },
-
-  // Specify an index for the table.
-  index: function(columns, name) {
-    return this._indexCommand('index', columns, name);
-  },
-
-  // Rename a column from one value to another value.
-  renameColumn: function(from, to) {
-    return this._addCommand('renameColumn', {from: from, to: to});
-  },
-
-  // Specify a foreign key for the table, also getting any
-  // relevant info from the chain during column.
-  foreign: function(column, name) {
-    var chained, chainable  = this._indexCommand('foreign', column, name);
-    if (_.isObject(column)) {
-      chained = _.pick(column, 'foreignColumn', 'foreignTable', 'commandOnDelete', 'commandOnUpdate');
+  // Convert an object into a list of `[key, value]` pairs.
+  _.pairs = function(obj) {
+    var keys = _.keys(obj);
+    var length = keys.length;
+    var pairs = new Array(length);
+    for (var i = 0; i < length; i++) {
+      pairs[i] = [keys[i], obj[keys[i]]];
     }
-    return _.extend(chainable, ForeignChainable, chained);
-  },
+    return pairs;
+  };
 
-  // Create a new auto-incrementing column on the table.
-  increments: function(column) {
-    return this._addColumn('integer', (column || 'id'), {isUnsigned: true, autoIncrement: true, length: 11});
-  },
+  // Invert the keys and values of an object. The values must be serializable.
+  _.invert = function(obj) {
+    var result = {};
+    var keys = _.keys(obj);
+    for (var i = 0, length = keys.length; i < length; i++) {
+      result[obj[keys[i]]] = keys[i];
+    }
+    return result;
+  };
 
-  // Create a new auto-incrementing big-int on the table
-  bigIncrements: function(column) {
-    return this._addColumn('bigInteger', (column || 'id'), {isUnsigned: true, autoIncrement: true});
-  },
+  // Return a sorted list of the function names available on the object.
+  // Aliased as `methods`
+  _.functions = _.methods = function(obj) {
+    var names = [];
+    for (var key in obj) {
+      if (_.isFunction(obj[key])) names.push(key);
+    }
+    return names.sort();
+  };
 
-  // Create a new string column on the table.
-  string: function(column, length) {
-    return this._addColumn('string', column, {length: (length || 255)});
-  },
-
-  // Alias varchar to string
-  varchar: function(column, length) {
-    return this.string(column, length);
-  },
-
-  // Create a new text column on the table.
-  text: function(column, length) {
-    return this._addColumn('text', column, {length: (length || false)});
-  },
-
-  // Create a new integer column on the table.
-  integer: function(column, length) {
-    return this._addColumn('integer', column, {length: (length || 11)});
-  },
-
-  // Create a new biginteger column on the table
-  bigInteger: function(column) {
-    return this._addColumn('bigInteger', column);
-  },
-
-  // Create a new tinyinteger column on the table.
-  tinyInteger: function(column) {
-    return this._addColumn('tinyInteger', column);
-  },
-
-  // Alias for tinyinteger column.
-  tinyint: function(column) {
-    return this.tinyInteger(column);
-  },
-
-  // Create a new float column on the table.
-  float: function(column, precision, scale) {
-    return this._addColumn('float', column, {
-      precision: (precision == null ? 8 : precision),
-      scale: (scale == null ? 2 : scale)
+  // Extend a given object with all the properties in passed-in object(s).
+  _.extend = function(obj) {
+    each(slice.call(arguments, 1), function(source) {
+      if (source) {
+        for (var prop in source) {
+          obj[prop] = source[prop];
+        }
+      }
     });
-  },
+    return obj;
+  };
 
-  // Create a new decimal column on the table.
-  decimal: function(column, precision, scale) {
-    return this._addColumn('decimal', column, {
-      precision: (precision == null ? 8 : precision),
-      scale: (scale == null ? 2 : scale)
+  // Return a copy of the object only containing the whitelisted properties.
+  _.pick = function(obj) {
+    var copy = {};
+    var keys = concat.apply(ArrayProto, slice.call(arguments, 1));
+    each(keys, function(key) {
+      if (key in obj) copy[key] = obj[key];
     });
-  },
+    return copy;
+  };
 
-  // Alias to "bool"
-  boolean: function(column) {
-    return this.bool(column);
-  },
-
-  // Create a new boolean column on the table
-  bool: function(column) {
-    return this._addColumn('boolean', column);
-  },
-
-  // Create a new date column on the table.
-  date: function(column) {
-    return this._addColumn('date', column);
-  },
-
-  // Create a new date-time column on the table.
-  dateTime: function(column) {
-    return this._addColumn('dateTime', column);
-  },
-
-  // Create a new time column on the table.
-  time: function(column) {
-    return this._addColumn('time', column);
-  },
-
-  // Create a new timestamp column on the table.
-  timestamp: function(column) {
-    return this._addColumn('timestamp', column);
-  },
-
-  // Add creation and update dateTime's to the table.
-  timestamps: function() {
-    this.dateTime('created_at');
-    this.dateTime('updated_at');
-  },
-
-  // Alias to enum.
-  "enum": function(column, allowed) {
-    return this.enu(column, allowed);
-  },
-
-  // Create a new enum column on the table.
-  enu: function(column, allowed) {
-    if (!_.isArray(allowed)) allowed = [allowed];
-    return this._addColumn('enum', column, {allowed: allowed});
-  },
-
-  // Create a new bit column on the table.
-  bit: function(column, length) {
-    return this._addColumn('bit', column, {length: (length || false)});
-  },
-
-  // Create a new binary column on the table.
-  binary: function(column) {
-    return this._addColumn('binary', column);
-  },
-
-  // Create a new json column on the table.
-  json: function(column) {
-    return this._addColumn('json', column);
-  },
-
-  // Create a new uuid column on the table.
-  uuid: function(column) {
-    return this._addColumn('uuid', column);
-  },
-
-  specificType: function(column, type) {
-    return this._addColumn('specificType', column, {specific: type});
-  },
-
-  // ----------------------------------------------------------------------
-
-  // Create a new drop index command on the blueprint.
-  // If the index is an array of columns, the developer means
-  // to drop an index merely by specifying the columns involved.
-  _dropIndexCommand: function(type, index) {
-    var columns = [];
-    if (_.isArray(index)) {
-      columns = index;
-      index = null;
+   // Return a copy of the object without the blacklisted properties.
+  _.omit = function(obj) {
+    var copy = {};
+    var keys = concat.apply(ArrayProto, slice.call(arguments, 1));
+    for (var key in obj) {
+      if (!_.contains(keys, key)) copy[key] = obj[key];
     }
-    return this._indexCommand(type, columns, index);
-  },
+    return copy;
+  };
 
-  // Add a new index command to the blueprint.
-  // If no name was specified for this index, we will create one using a basic
-  // convention of the table name, followed by the columns, followed by an
-  // index type, such as primary or index, which makes the index unique.
-  _indexCommand: function(type, columns, index) {
-    index || (index = null);
-    if (!_.isArray(columns)) columns = columns ? [columns] : [];
-    if (index === null) {
-      var table = this.table.replace(/\.|-/g, '_');
-      index = (table + '_' + _.map(columns, function(col) { return col.name || col; }).join('_') + '_' + type).toLowerCase();
+  // Fill in a given object with default properties.
+  _.defaults = function(obj) {
+    each(slice.call(arguments, 1), function(source) {
+      if (source) {
+        for (var prop in source) {
+          if (obj[prop] === void 0) obj[prop] = source[prop];
+        }
+      }
+    });
+    return obj;
+  };
+
+  // Create a (shallow-cloned) duplicate of an object.
+  _.clone = function(obj) {
+    if (!_.isObject(obj)) return obj;
+    return _.isArray(obj) ? obj.slice() : _.extend({}, obj);
+  };
+
+  // Invokes interceptor with the obj, and then returns obj.
+  // The primary purpose of this method is to "tap into" a method chain, in
+  // order to perform operations on intermediate results within the chain.
+  _.tap = function(obj, interceptor) {
+    interceptor(obj);
+    return obj;
+  };
+
+  // Internal recursive comparison function for `isEqual`.
+  var eq = function(a, b, aStack, bStack) {
+    // Identical objects are equal. `0 === -0`, but they aren't identical.
+    // See the [Harmony `egal` proposal](http://wiki.ecmascript.org/doku.php?id=harmony:egal).
+    if (a === b) return a !== 0 || 1 / a == 1 / b;
+    // A strict comparison is necessary because `null == undefined`.
+    if (a == null || b == null) return a === b;
+    // Unwrap any wrapped objects.
+    if (a instanceof _) a = a._wrapped;
+    if (b instanceof _) b = b._wrapped;
+    // Compare `[[Class]]` names.
+    var className = toString.call(a);
+    if (className != toString.call(b)) return false;
+    switch (className) {
+      // Strings, numbers, dates, and booleans are compared by value.
+      case '[object String]':
+        // Primitives and their corresponding object wrappers are equivalent; thus, `"5"` is
+        // equivalent to `new String("5")`.
+        return a == String(b);
+      case '[object Number]':
+        // `NaN`s are equivalent, but non-reflexive. An `egal` comparison is performed for
+        // other numeric values.
+        return a != +a ? b != +b : (a == 0 ? 1 / a == 1 / b : a == +b);
+      case '[object Date]':
+      case '[object Boolean]':
+        // Coerce dates and booleans to numeric primitive values. Dates are compared by their
+        // millisecond representations. Note that invalid dates with millisecond representations
+        // of `NaN` are not equivalent.
+        return +a == +b;
+      // RegExps are compared by their source patterns and flags.
+      case '[object RegExp]':
+        return a.source == b.source &&
+               a.global == b.global &&
+               a.multiline == b.multiline &&
+               a.ignoreCase == b.ignoreCase;
     }
-    return this._addCommand(type, {index: index, columns: columns});
-  },
-
-  // Add a new column to the blueprint.
-  _addColumn: function(type, name, parameters) {
-    if (!name) throw new Error('A `name` must be defined to add a column');
-    var column = _.extend({type: type, name: name}, ChainableColumn, parameters);
-    this.columns.push(column);
-    return column;
-  },
-
-  // Add a new command to the blueprint.
-  _addCommand: function(name, parameters) {
-    var command = _.extend({name: name}, parameters);
-    this.commands.push(command);
-    return command;
-  }
-});
-
-var ForeignChainable = {
-
-  // Sets the "column" that the current column references
-  // as the a foreign key
-  references: function(column) {
-    this.isForeign = true;
-    this.foreignColumn = column || null;
-    return this;
-  },
-
-  // Sets the "table" where the foreign key column is located.
-  inTable: function(table) {
-    this.foreignTable = table || null;
-    return this;
-  },
-
-  // SQL command to run "onDelete"
-  onDelete: function(command) {
-    this.commandOnDelete = command || null;
-    return this;
-  },
-
-  // SQL command to run "onUpdate"
-  onUpdate: function(command) {
-    this.commandOnUpdate = command || null;
-    return this;
-  }
-
-};
-
-var ChainableColumn = _.extend({
-
-  // Sets the default value for a column.
-  // For `boolean` columns, we'll permit 'false'
-  // to be used as default values.
-  defaultTo: function(value) {
-    if (this.type === 'boolean') {
-      if (value === 'false') value = 0;
-      value = (value ? 1 : 0);
+    if (typeof a != 'object' || typeof b != 'object') return false;
+    // Assume equality for cyclic structures. The algorithm for detecting cyclic
+    // structures is adapted from ES 5.1 section 15.12.3, abstract operation `JO`.
+    var length = aStack.length;
+    while (length--) {
+      // Linear search. Performance is inversely proportional to the number of
+      // unique nested structures.
+      if (aStack[length] == a) return bStack[length] == b;
     }
-    this.defaultValue = value;
-    return this;
-  },
-
-  // Sets an integer as unsigned, is a no-op
-  // if the column type is not an integer.
-  unsigned: function() {
-    this.isUnsigned = true;
-    return this;
-  },
-
-  // Allows the column to contain null values.
-  nullable: function() {
-    this.isNullable = true;
-    return this;
-  },
-
-  // Disallow the column from containing null values.
-  notNull: function() {
-    this.isNullable = false;
-    return this;
-  },
-
-  // Disallow the column from containing null values.
-  notNullable: function() {
-    this.isNullable = false;
-    return this;
-  },
-
-  // Adds an index on the specified column.
-  index: function(name) {
-    this.isIndex = name || true;
-    return this;
-  },
-
-  // Sets this column as the primary key.
-  primary: function(name) {
-    if (!this.autoIncrement) {
-      this.isPrimary = name || true;
+    // Objects with different constructors are not equivalent, but `Object`s
+    // from different frames are.
+    var aCtor = a.constructor, bCtor = b.constructor;
+    if (aCtor !== bCtor && !(_.isFunction(aCtor) && (aCtor instanceof aCtor) &&
+                             _.isFunction(bCtor) && (bCtor instanceof bCtor))
+                        && ('constructor' in a && 'constructor' in b)) {
+      return false;
     }
-    return this;
-  },
+    // Add the first object to the stack of traversed objects.
+    aStack.push(a);
+    bStack.push(b);
+    var size = 0, result = true;
+    // Recursively compare objects and arrays.
+    if (className == '[object Array]') {
+      // Compare array lengths to determine if a deep comparison is necessary.
+      size = a.length;
+      result = size == b.length;
+      if (result) {
+        // Deep compare the contents, ignoring non-numeric properties.
+        while (size--) {
+          if (!(result = eq(a[size], b[size], aStack, bStack))) break;
+        }
+      }
+    } else {
+      // Deep compare objects.
+      for (var key in a) {
+        if (_.has(a, key)) {
+          // Count the expected number of properties.
+          size++;
+          // Deep compare each member.
+          if (!(result = _.has(b, key) && eq(a[key], b[key], aStack, bStack))) break;
+        }
+      }
+      // Ensure that both objects contain the same number of properties.
+      if (result) {
+        for (key in b) {
+          if (_.has(b, key) && !(size--)) break;
+        }
+        result = !size;
+      }
+    }
+    // Remove the first object from the stack of traversed objects.
+    aStack.pop();
+    bStack.pop();
+    return result;
+  };
 
-  // Sets this column as unique.
-  unique: function(name) {
-    this.isUnique = name || true;
-    return this;
-  },
+  // Perform a deep comparison to check if two objects are equal.
+  _.isEqual = function(a, b) {
+    return eq(a, b, [], []);
+  };
 
-  // Sets the column to be inserted after another,
-  // used in MySql alter tables.
-  after: function(name) {
-    this.isAfter = name;
-    return this;
-  },
+  // Is a given array, string, or object empty?
+  // An "empty" object has no enumerable own-properties.
+  _.isEmpty = function(obj) {
+    if (obj == null) return true;
+    if (_.isArray(obj) || _.isString(obj)) return obj.length === 0;
+    for (var key in obj) if (_.has(obj, key)) return false;
+    return true;
+  };
 
-  // Adds a comment to this column.
-  comment: function(comment) {
-    this.isCommented = comment || null;
-    return this;
-  }
+  // Is a given value a DOM element?
+  _.isElement = function(obj) {
+    return !!(obj && obj.nodeType === 1);
+  };
 
-}, ForeignChainable);
+  // Is a given value an array?
+  // Delegates to ECMA5's native Array.isArray
+  _.isArray = nativeIsArray || function(obj) {
+    return toString.call(obj) == '[object Array]';
+  };
 
-exports.SchemaBuilder = SchemaBuilder;
+  // Is a given variable an object?
+  _.isObject = function(obj) {
+    return obj === Object(obj);
+  };
 
-},{"./common":15,"./helpers":16,"./raw":18,"lodash":62}],20:[function(require,module,exports){
-// Schema Interface
-// -------
-
-// The SchemaInterface are the publically accessible methods
-// when creating or modifying an existing schema, Each of
-// these methods are mixed into the `knex.schema` object,
-// and pass-through to creating a `SchemaBuilder` instance,
-// which is used as the context of the `this` value below.
-var SchemaInterface = {
-
-  // Modify a table on the schema.
-  table: function(callback) {
-    this.callback(callback);
-    return this._setType('table');
-  },
-
-  // Create a new table on the schema.
-  createTable: function(callback) {
-    this._addCommand('createTable');
-    this.callback(callback);
-    return this._setType('createTable');
-  },
-
-  // Drop a table from the schema.
-  dropTable: function() {
-    this._addCommand('dropTable');
-    return this._setType('dropTable');
-  },
-
-  // Drop a table from the schema if it exists.
-  dropTableIfExists: function() {
-    this._addCommand('dropTableIfExists');
-    return this._setType('dropTableIfExists');
-  },
-
-  // Rename a table on the schema.
-  renameTable: function(to) {
-    this._addCommand('renameTable', {to: to});
-    return this._setType('renameTable');
-  },
-
-  // Determine if the given table exists.
-  hasTable: function() {
-    this.bindings.push(this.table);
-    this._addCommand('tableExists');
-    return this._setType('tableExists');
-  },
-
-  // Determine if the column exists
-  hasColumn: function(column) {
-    this.bindings.push(this.table, column);
-    this._addCommand('columnExists');
-    return this._setType('columnExists');
-  }
-
-};
-
-exports.SchemaInterface = SchemaInterface;
-
-},{}],21:[function(require,module,exports){
-(function (Buffer){
-// SQL String
-// -------
-
-// A few functions taken from the node-mysql lib, so it can be easily used with any
-// library on the `toString` method, and on the browser.
-var SqlString = {};
-var _         = require('lodash');
-
-// Send in a "sql" string, values, and an optional timeZone
-// and have it returned as a properly formatted SQL query.
-SqlString.format = function(sql, values, timeZone) {
-  values = [].concat(values);
-  return sql.replace(/\?/g, function(match) {
-    if (!values.length) return match;
-    return SqlString.escape(values.shift(), timeZone);
+  // Add some isType methods: isArguments, isFunction, isString, isNumber, isDate, isRegExp.
+  each(['Arguments', 'Function', 'String', 'Number', 'Date', 'RegExp'], function(name) {
+    _['is' + name] = function(obj) {
+      return toString.call(obj) == '[object ' + name + ']';
+    };
   });
-};
 
-SqlString.escape = function(val, timeZone) {
-  if (val === undefined || val === null) {
-    return 'NULL';
+  // Define a fallback version of the method in browsers (ahem, IE), where
+  // there isn't any inspectable "Arguments" type.
+  if (!_.isArguments(arguments)) {
+    _.isArguments = function(obj) {
+      return !!(obj && _.has(obj, 'callee'));
+    };
   }
 
-  switch (typeof val) {
-    case 'boolean': return (val) ? 'true' : 'false';
-    case 'number': return val+'';
+  // Optimize `isFunction` if appropriate.
+  if (typeof (/./) !== 'function') {
+    _.isFunction = function(obj) {
+      return typeof obj === 'function';
+    };
   }
 
-  if (val instanceof Date) {
-    val = SqlString.dateToString(val, timeZone || "Z");
-  }
+  // Is a given object a finite number?
+  _.isFinite = function(obj) {
+    return isFinite(obj) && !isNaN(parseFloat(obj));
+  };
 
-  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(val)) {
-    return SqlString.bufferToString(val);
-  }
+  // Is the given value `NaN`? (NaN is the only number which does not equal itself).
+  _.isNaN = function(obj) {
+    return _.isNumber(obj) && obj != +obj;
+  };
 
-  if (_.isArray(val)) {
-    return SqlString.arrayToList(val, timeZone);
-  }
+  // Is a given value a boolean?
+  _.isBoolean = function(obj) {
+    return obj === true || obj === false || toString.call(obj) == '[object Boolean]';
+  };
 
-  if (typeof val === 'object') val = val.toString();
+  // Is a given value equal to null?
+  _.isNull = function(obj) {
+    return obj === null;
+  };
 
-  val = val.replace(/[\0\n\r\b\t\\\'\"\x1a]/g, function(s) {
-    switch(s) {
-      case "\0": return "\\0";
-      case "\n": return "\\n";
-      case "\r": return "\\r";
-      case "\b": return "\\b";
-      case "\t": return "\\t";
-      case "\x1a": return "\\Z";
-      default: return "\\"+s;
+  // Is a given variable undefined?
+  _.isUndefined = function(obj) {
+    return obj === void 0;
+  };
+
+  // Shortcut function for checking if an object has a given property directly
+  // on itself (in other words, not on a prototype).
+  _.has = function(obj, key) {
+    return hasOwnProperty.call(obj, key);
+  };
+
+  // Utility Functions
+  // -----------------
+
+  // Run Underscore.js in *noConflict* mode, returning the `_` variable to its
+  // previous owner. Returns a reference to the Underscore object.
+  _.noConflict = function() {
+    root._ = previousUnderscore;
+    return this;
+  };
+
+  // Keep the identity function around for default iterators.
+  _.identity = function(value) {
+    return value;
+  };
+
+  _.constant = function(value) {
+    return function () {
+      return value;
+    };
+  };
+
+  _.property = function(key) {
+    return function(obj) {
+      return obj[key];
+    };
+  };
+
+  // Returns a predicate for checking whether an object has a given set of `key:value` pairs.
+  _.matches = function(attrs) {
+    return function(obj) {
+      if (obj === attrs) return true; //avoid comparing an object to itself.
+      for (var key in attrs) {
+        if (attrs[key] !== obj[key])
+          return false;
+      }
+      return true;
     }
+  };
+
+  // Run a function **n** times.
+  _.times = function(n, iterator, context) {
+    var accum = Array(Math.max(0, n));
+    for (var i = 0; i < n; i++) accum[i] = iterator.call(context, i);
+    return accum;
+  };
+
+  // Return a random integer between min and max (inclusive).
+  _.random = function(min, max) {
+    if (max == null) {
+      max = min;
+      min = 0;
+    }
+    return min + Math.floor(Math.random() * (max - min + 1));
+  };
+
+  // A (possibly faster) way to get the current timestamp as an integer.
+  _.now = Date.now || function() { return new Date().getTime(); };
+
+  // List of HTML entities for escaping.
+  var entityMap = {
+    escape: {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#x27;'
+    }
+  };
+  entityMap.unescape = _.invert(entityMap.escape);
+
+  // Regexes containing the keys and values listed immediately above.
+  var entityRegexes = {
+    escape:   new RegExp('[' + _.keys(entityMap.escape).join('') + ']', 'g'),
+    unescape: new RegExp('(' + _.keys(entityMap.unescape).join('|') + ')', 'g')
+  };
+
+  // Functions for escaping and unescaping strings to/from HTML interpolation.
+  _.each(['escape', 'unescape'], function(method) {
+    _[method] = function(string) {
+      if (string == null) return '';
+      return ('' + string).replace(entityRegexes[method], function(match) {
+        return entityMap[method][match];
+      });
+    };
   });
-  return "'"+val+"'";
-};
 
-SqlString.arrayToList = function(array, timeZone) {
-  return array.map(function(v) {
-    if (Array.isArray(v)) return '(' + SqlString.arrayToList(v) + ')';
-    return SqlString.escape(v, true, timeZone);
-  }).join(', ');
-};
+  // If the value of the named `property` is a function then invoke it with the
+  // `object` as context; otherwise, return it.
+  _.result = function(object, property) {
+    if (object == null) return void 0;
+    var value = object[property];
+    return _.isFunction(value) ? value.call(object) : value;
+  };
 
-SqlString.dateToString = function(date, timeZone) {
-  var dt = new Date(date);
+  // Add your own custom functions to the Underscore object.
+  _.mixin = function(obj) {
+    each(_.functions(obj), function(name) {
+      var func = _[name] = obj[name];
+      _.prototype[name] = function() {
+        var args = [this._wrapped];
+        push.apply(args, arguments);
+        return result.call(this, func.apply(_, args));
+      };
+    });
+  };
 
-  if (timeZone != 'local') {
-    var tz = convertTimezone(timeZone);
-    dt.setTime(dt.getTime() + (dt.getTimezoneOffset() * 60000));
-    if (tz !== false) {
-      dt.setTime(dt.getTime() + (tz * 60000));
+  // Generate a unique integer id (unique within the entire client session).
+  // Useful for temporary DOM ids.
+  var idCounter = 0;
+  _.uniqueId = function(prefix) {
+    var id = ++idCounter + '';
+    return prefix ? prefix + id : id;
+  };
+
+  // By default, Underscore uses ERB-style template delimiters, change the
+  // following template settings to use alternative delimiters.
+  _.templateSettings = {
+    evaluate    : /<%([\s\S]+?)%>/g,
+    interpolate : /<%=([\s\S]+?)%>/g,
+    escape      : /<%-([\s\S]+?)%>/g
+  };
+
+  // When customizing `templateSettings`, if you don't want to define an
+  // interpolation, evaluation or escaping regex, we need one that is
+  // guaranteed not to match.
+  var noMatch = /(.)^/;
+
+  // Certain characters need to be escaped so that they can be put into a
+  // string literal.
+  var escapes = {
+    "'":      "'",
+    '\\':     '\\',
+    '\r':     'r',
+    '\n':     'n',
+    '\t':     't',
+    '\u2028': 'u2028',
+    '\u2029': 'u2029'
+  };
+
+  var escaper = /\\|'|\r|\n|\t|\u2028|\u2029/g;
+
+  // JavaScript micro-templating, similar to John Resig's implementation.
+  // Underscore templating handles arbitrary delimiters, preserves whitespace,
+  // and correctly escapes quotes within interpolated code.
+  _.template = function(text, data, settings) {
+    var render;
+    settings = _.defaults({}, settings, _.templateSettings);
+
+    // Combine delimiters into one regular expression via alternation.
+    var matcher = new RegExp([
+      (settings.escape || noMatch).source,
+      (settings.interpolate || noMatch).source,
+      (settings.evaluate || noMatch).source
+    ].join('|') + '|$', 'g');
+
+    // Compile the template source, escaping string literals appropriately.
+    var index = 0;
+    var source = "__p+='";
+    text.replace(matcher, function(match, escape, interpolate, evaluate, offset) {
+      source += text.slice(index, offset)
+        .replace(escaper, function(match) { return '\\' + escapes[match]; });
+
+      if (escape) {
+        source += "'+\n((__t=(" + escape + "))==null?'':_.escape(__t))+\n'";
+      }
+      if (interpolate) {
+        source += "'+\n((__t=(" + interpolate + "))==null?'':__t)+\n'";
+      }
+      if (evaluate) {
+        source += "';\n" + evaluate + "\n__p+='";
+      }
+      index = offset + match.length;
+      return match;
+    });
+    source += "';\n";
+
+    // If a variable is not specified, place data values in local scope.
+    if (!settings.variable) source = 'with(obj||{}){\n' + source + '}\n';
+
+    source = "var __t,__p='',__j=Array.prototype.join," +
+      "print=function(){__p+=__j.call(arguments,'');};\n" +
+      source + "return __p;\n";
+
+    try {
+      render = new Function(settings.variable || 'obj', '_', source);
+    } catch (e) {
+      e.source = source;
+      throw e;
     }
-  }
 
-  var year   = dt.getFullYear();
-  var month  = zeroPad(dt.getMonth() + 1);
-  var day    = zeroPad(dt.getDate());
-  var hour   = zeroPad(dt.getHours());
-  var minute = zeroPad(dt.getMinutes());
-  var second = zeroPad(dt.getSeconds());
-
-  return year + '-' + month + '-' + day + ' ' + hour + ':' + minute + ':' + second;
-};
-
-SqlString.bufferToString = function(buffer) {
-  var hex = '';
-  try {
-    hex = buffer.toString('hex');
-  } catch (err) {
-    // node v0.4.x does not support hex / throws unknown encoding error
-    for (var i = 0; i < buffer.length; i++) {
-      var byte = buffer[i];
-      hex += zeroPad(byte.toString(16));
-    }
-  }
-
-  return "X'" + hex+ "'";
-};
-
-function zeroPad(number) {
-  return (number < 10) ? '0' + number : number;
-}
-
-function convertTimezone(tz) {
-  if (tz == "Z") return 0;
-
-  var m = tz.match(/([\+\-\s])(\d\d):?(\d\d)?/);
-  if (m) {
-    return (m[1] == '-' ? -1 : 1) * (parseInt(m[2], 10) + ((m[3] ? parseInt(m[3], 10) : 0) / 60)) * 60;
-  }
-  return false;
-}
-
-exports.SqlString = SqlString;
-
-}).call(this,require("buffer").Buffer)
-},{"buffer":63,"lodash":62}],22:[function(require,module,exports){
-// Transaction
-// -------
-var Promise = require('./promise').Promise;
-var _       = require('lodash');
-
-// Creates a new wrapper object for constructing a transaction.
-// Called by the `knex.transaction`, which sets the correct client
-// and handles the `container` object, passing along the correct
-// `connection` to keep all of the transactions on the correct connection.
-var Transaction = function(instance) {
-  this.client = instance.client;
-};
-
-Transaction.prototype = {
-
-  // Passed a `container` function, this method runs the current
-  // transaction, returning a promise.
-  run: function(container, connection) {
-    return this.client.startTransaction(connection)
-      .bind(this)
-      .then(this.getContainerObject)
-      .then(this.initiateDeferred(container))
-      .bind();
-  },
-
-  getContainerObject: function(connection) {
-
-    // The client we need to call `finishTransaction` on.
-    var client = this.client;
-
-    // The object passed around inside the transaction container.
-    var containerObj = {
-
-      commit: function(message) {
-        client.finishTransaction('commit', this, message);
-      },
-
-      rollback: function(error) {
-        client.finishTransaction('rollback', this, error);
-      },
-
-      // "rollback to"?
-      connection: connection
+    if (data) return render(data, _);
+    var template = function(data) {
+      return render.call(this, data, _);
     };
 
-    // Ensure the transacting object methods are bound with the correct context.
-    _.bindAll(containerObj, 'commit', 'rollback');
+    // Provide the compiled function source as a convenience for precompilation.
+    template.source = 'function(' + (settings.variable || 'obj') + '){\n' + source + '}';
 
-    return containerObj;
-  },
+    return template;
+  };
 
-  initiateDeferred: function(container) {
+  // Add a "chain" function, which will delegate to the wrapper.
+  _.chain = function(obj) {
+    return _(obj).chain();
+  };
 
-    return function(containerObj) {
+  // OOP
+  // ---------------
+  // If Underscore is called as a function, it returns a wrapped object that
+  // can be used OO-style. This wrapper holds altered versions of all the
+  // underscore functions. Wrapped objects may be chained.
 
-      // Initiate a deferred object, so we know when the
-      // transaction completes or fails, we know what to do.
-      var dfd = containerObj.dfd = Promise.pending();
+  // Helper function to continue chaining intermediate results.
+  var result = function(obj) {
+    return this._chain ? _(obj).chain() : obj;
+  };
 
-      // Call the container with the transaction
-      // commit & rollback objects.
-      container(containerObj);
+  // Add all of the Underscore functions to the wrapper object.
+  _.mixin(_);
 
-      // Return the promise for the entire transaction.
-      return dfd.promise;
-
+  // Add all mutator Array functions to the wrapper.
+  each(['pop', 'push', 'reverse', 'shift', 'sort', 'splice', 'unshift'], function(name) {
+    var method = ArrayProto[name];
+    _.prototype[name] = function() {
+      var obj = this._wrapped;
+      method.apply(obj, arguments);
+      if ((name == 'shift' || name == 'splice') && obj.length === 0) delete obj[0];
+      return result.call(this, obj);
     };
+  });
 
+  // Add all accessor Array functions to the wrapper.
+  each(['concat', 'join', 'slice'], function(name) {
+    var method = ArrayProto[name];
+    _.prototype[name] = function() {
+      return result.call(this, method.apply(this._wrapped, arguments));
+    };
+  });
+
+  _.extend(_.prototype, {
+
+    // Start chaining a wrapped Underscore object.
+    chain: function() {
+      this._chain = true;
+      return this;
+    },
+
+    // Extracts the result from a wrapped and chained object.
+    value: function() {
+      return this._wrapped;
+    }
+
+  });
+
+  // AMD registration happens at the end for compatibility with AMD loaders
+  // that may not enforce next-turn semantics on modules. Even though general
+  // practice for AMD registration is to be anonymous, underscore registers
+  // as a named module because, like jQuery, it is a base library that is
+  // popular enough to be bundled in a third party lib, but not be part of
+  // an AMD load request. Those cases could generate an error when an
+  // anonymous define() is called outside of a loader request.
+  if (typeof define === 'function' && define.amd) {
+    define('underscore', [], function() {
+      return _;
+    });
   }
+}).call(this);
 
-};
-
-exports.Transaction = Transaction;
-
-},{"./promise":17,"lodash":62}],23:[function(require,module,exports){
+},{}],17:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -3036,7 +4756,7 @@ module.exports = function(Promise, Promise$_CreatePromiseArray, PromiseArray) {
 
 };
 
-},{"./assert.js":24,"./some_promise_array.js":56}],24:[function(require,module,exports){
+},{"./assert.js":18,"./some_promise_array.js":50}],18:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -3087,7 +4807,7 @@ module.exports = (function(){
     };
 })();
 
-},{}],25:[function(require,module,exports){
+},{}],19:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -3184,7 +4904,7 @@ Async.prototype._reset = function Async$_reset() {
 
 module.exports = new Async();
 
-},{"./assert.js":24,"./queue.js":49,"./schedule.js":52,"./util.js":60}],26:[function(require,module,exports){
+},{"./assert.js":18,"./queue.js":43,"./schedule.js":46,"./util.js":54}],20:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -3240,7 +4960,7 @@ module.exports = function(Promise) {
     };
 };
 
-},{}],27:[function(require,module,exports){
+},{}],21:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -3319,7 +5039,7 @@ module.exports = function(Promise, INTERNAL) {
     };
 };
 
-},{"./assert.js":24,"./async.js":25,"./errors.js":31}],28:[function(require,module,exports){
+},{"./assert.js":18,"./async.js":19,"./errors.js":25}],22:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -3558,7 +5278,7 @@ var captureStackTrace = (function stackDetection() {
 return CapturedTrace;
 };
 
-},{"./assert.js":24,"./es5.js":33,"./util.js":60}],29:[function(require,module,exports){
+},{"./assert.js":18,"./es5.js":27,"./util.js":54}],23:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -3648,7 +5368,7 @@ CatchFilter.prototype.doFilter = function CatchFilter$_doFilter(e) {
 return CatchFilter;
 };
 
-},{"./es5.js":33,"./util.js":60}],30:[function(require,module,exports){
+},{"./es5.js":27,"./util.js":54}],24:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -3733,7 +5453,7 @@ function Promise$thenThrow(reason) {
 };
 };
 
-},{"./assert.js":24,"./util.js":60}],31:[function(require,module,exports){
+},{"./assert.js":18,"./util.js":54}],25:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -3900,7 +5620,7 @@ module.exports = {
     canAttach: canAttach
 };
 
-},{"./es5.js":33,"./global.js":37,"./util.js":60}],32:[function(require,module,exports){
+},{"./es5.js":27,"./global.js":31,"./util.js":54}],26:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -3939,7 +5659,7 @@ function apiRejection(msg) {
 return apiRejection;
 };
 
-},{"./errors.js":31}],33:[function(require,module,exports){
+},{"./errors.js":25}],27:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -4029,7 +5749,7 @@ else {
     };
 }
 
-},{}],34:[function(require,module,exports){
+},{}],28:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -4084,7 +5804,7 @@ module.exports = function(Promise) {
     };
 };
 
-},{"./assert.js":24,"./util.js":60}],35:[function(require,module,exports){
+},{"./assert.js":18,"./util.js":54}],29:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -4192,7 +5912,7 @@ module.exports = function(Promise, NEXT_FILTER) {
     };
 };
 
-},{"./errors.js":31,"./util.js":60}],36:[function(require,module,exports){
+},{"./errors.js":25,"./util.js":54}],30:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -4245,7 +5965,7 @@ module.exports = function(Promise, apiRejection, INTERNAL) {
     };
 };
 
-},{"./errors.js":31,"./promise_spawn.js":45}],37:[function(require,module,exports){
+},{"./errors.js":25,"./promise_spawn.js":39}],31:[function(require,module,exports){
 (function (process,global){
 /**
  * Copyright (c) 2013 Petka Antonov
@@ -4290,7 +6010,7 @@ module.exports = (function(){
 })();
 
 }).call(this,require("/usr/local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"/usr/local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":66}],38:[function(require,module,exports){
+},{"/usr/local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":57}],32:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -4420,7 +6140,7 @@ module.exports = function(
     };
 };
 
-},{"./assert.js":24}],39:[function(require,module,exports){
+},{"./assert.js":18}],33:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -4485,7 +6205,7 @@ module.exports = function(Promise) {
     };
 };
 
-},{"./assert.js":24,"./async.js":25,"./util.js":60}],40:[function(require,module,exports){
+},{"./assert.js":18,"./async.js":19,"./util.js":54}],34:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -4600,7 +6320,7 @@ module.exports = function(Promise, isPromiseArrayProxy) {
     };
 };
 
-},{"./assert.js":24,"./async.js":25,"./util.js":60}],41:[function(require,module,exports){
+},{"./assert.js":18,"./async.js":19,"./util.js":54}],35:[function(require,module,exports){
 (function (process){
 /**
  * Copyright (c) 2013 Petka Antonov
@@ -5756,7 +7476,7 @@ return Promise;
 };
 
 }).call(this,require("/usr/local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"./any.js":23,"./assert.js":24,"./async.js":25,"./call_get.js":26,"./cancel.js":27,"./captured_trace.js":28,"./catch_filter.js":29,"./direct_resolve.js":30,"./errors.js":31,"./errors_api_rejection":32,"./filter.js":34,"./finally.js":35,"./generators.js":36,"./global.js":37,"./map.js":38,"./nodeify.js":39,"./progress.js":40,"./promise_array.js":42,"./promise_resolver.js":44,"./promisify.js":46,"./props.js":48,"./race.js":50,"./reduce.js":51,"./settle.js":53,"./some.js":55,"./synchronous_inspection.js":57,"./thenables.js":58,"./timers.js":59,"./util.js":60,"/usr/local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":66}],42:[function(require,module,exports){
+},{"./any.js":17,"./assert.js":18,"./async.js":19,"./call_get.js":20,"./cancel.js":21,"./captured_trace.js":22,"./catch_filter.js":23,"./direct_resolve.js":24,"./errors.js":25,"./errors_api_rejection":26,"./filter.js":28,"./finally.js":29,"./generators.js":30,"./global.js":31,"./map.js":32,"./nodeify.js":33,"./progress.js":34,"./promise_array.js":36,"./promise_resolver.js":38,"./promisify.js":40,"./props.js":42,"./race.js":44,"./reduce.js":45,"./settle.js":47,"./some.js":49,"./synchronous_inspection.js":51,"./thenables.js":52,"./timers.js":53,"./util.js":54,"/usr/local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":57}],36:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -5986,7 +7706,7 @@ function PromiseArray$_promiseRejected(reason, index) {
 return PromiseArray;
 };
 
-},{"./assert.js":24,"./async.js":25,"./errors.js":31,"./util.js":60}],43:[function(require,module,exports){
+},{"./assert.js":18,"./async.js":19,"./errors.js":25,"./util.js":54}],37:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -6053,7 +7773,7 @@ PromiseInspection.prototype.error = function PromiseInspection$error() {
 
 module.exports = PromiseInspection;
 
-},{"./errors.js":31}],44:[function(require,module,exports){
+},{"./errors.js":25}],38:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -6191,7 +7911,7 @@ PromiseResolver.prototype.toJSON = function PromiseResolver$toJSON() {
 
 module.exports = PromiseResolver;
 
-},{"./async.js":25,"./errors.js":31,"./es5.js":33,"./util.js":60}],45:[function(require,module,exports){
+},{"./async.js":19,"./errors.js":25,"./es5.js":27,"./util.js":54}],39:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -6298,7 +8018,7 @@ PromiseSpawn.prototype._next = function PromiseSpawn$_next(value) {
 return PromiseSpawn;
 };
 
-},{"./errors.js":31,"./util.js":60}],46:[function(require,module,exports){
+},{"./errors.js":25,"./util.js":54}],40:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -6538,7 +8258,7 @@ Promise.promisifyAll = function Promise$PromisifyAll(target) {
 };
 
 
-},{"./assert.js":24,"./es5.js":33,"./promise_resolver.js":44,"./util.js":60}],47:[function(require,module,exports){
+},{"./assert.js":18,"./es5.js":27,"./promise_resolver.js":38,"./util.js":54}],41:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -6617,7 +8337,7 @@ PromiseArray.PropertiesPromiseArray = PropertiesPromiseArray;
 return PropertiesPromiseArray;
 };
 
-},{"./assert.js":24,"./es5.js":33,"./util.js":60}],48:[function(require,module,exports){
+},{"./assert.js":18,"./es5.js":27,"./util.js":54}],42:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -6683,7 +8403,7 @@ module.exports = function(Promise, PromiseArray) {
     };
 };
 
-},{"./errors_api_rejection":32,"./properties_promise_array.js":47,"./util.js":60}],49:[function(require,module,exports){
+},{"./errors_api_rejection":26,"./properties_promise_array.js":41,"./util.js":54}],43:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -6820,7 +8540,7 @@ Queue.prototype._resizeTo = function Queue$_resizeTo(capacity) {
 
 module.exports = Queue;
 
-},{"./assert.js":24}],50:[function(require,module,exports){
+},{"./assert.js":18}],44:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -6906,7 +8626,7 @@ module.exports = function(Promise, INTERNAL) {
 
 };
 
-},{"./errors_api_rejection.js":32,"./util.js":60}],51:[function(require,module,exports){
+},{"./errors_api_rejection.js":26,"./util.js":54}],45:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -7082,7 +8802,7 @@ module.exports = function(
     };
 };
 
-},{"./assert.js":24}],52:[function(require,module,exports){
+},{"./assert.js":18}],46:[function(require,module,exports){
 (function (process){
 /**
  * Copyright (c) 2013 Petka Antonov
@@ -7205,7 +8925,7 @@ else {
 module.exports = schedule;
 
 }).call(this,require("/usr/local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js"))
-},{"./assert.js":24,"./global.js":37,"/usr/local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":66}],53:[function(require,module,exports){
+},{"./assert.js":18,"./global.js":31,"/usr/local/lib/node_modules/browserify/node_modules/insert-module-globals/node_modules/process/browser.js":57}],47:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -7255,7 +8975,7 @@ module.exports =
 
 };
 
-},{"./settled_promise_array.js":54}],54:[function(require,module,exports){
+},{"./settled_promise_array.js":48}],48:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -7317,7 +9037,7 @@ function SettledPromiseArray$_promiseRejected(reason, index) {
 return SettledPromiseArray;
 };
 
-},{"./assert.js":24,"./promise_inspection.js":43,"./util.js":60}],55:[function(require,module,exports){
+},{"./assert.js":18,"./promise_inspection.js":37,"./util.js":54}],49:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -7377,7 +9097,7 @@ function(Promise, Promise$_CreatePromiseArray, PromiseArray, apiRejection) {
 
 };
 
-},{"./assert.js":24,"./some_promise_array.js":56}],56:[function(require,module,exports){
+},{"./assert.js":18,"./some_promise_array.js":50}],50:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -7509,7 +9229,7 @@ function SomePromiseArray$_canPossiblyFulfill() {
 return SomePromiseArray;
 };
 
-},{"./errors.js":31,"./util.js":60}],57:[function(require,module,exports){
+},{"./errors.js":25,"./util.js":54}],51:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -7540,7 +9260,7 @@ module.exports = function(Promise) {
     };
 };
 
-},{"./promise_inspection.js":43}],58:[function(require,module,exports){
+},{"./promise_inspection.js":37}],52:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -7647,7 +9367,7 @@ module.exports = function(Promise) {
     Promise._cast = Promise$_Cast;
 };
 
-},{"./assert.js":24,"./util.js":60}],59:[function(require,module,exports){
+},{"./assert.js":18,"./util.js":54}],53:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -7767,7 +9487,7 @@ module.exports = function(Promise, INTERNAL) {
 
 };
 
-},{"./assert.js":24,"./errors.js":31,"./errors_api_rejection":32,"./global.js":37,"./util.js":60}],60:[function(require,module,exports){
+},{"./assert.js":18,"./errors.js":25,"./errors_api_rejection":26,"./global.js":31,"./util.js":54}],54:[function(require,module,exports){
 /**
  * Copyright (c) 2013 Petka Antonov
  * 
@@ -7975,340 +9695,7 @@ var ret = {
 
 module.exports = ret;
 
-},{"./assert.js":24,"./es5.js":33,"./global.js":37}],61:[function(require,module,exports){
-// Generic Pool Redux
-//
-// Fork of https://github.com/coopernurse/node-pool
-// with prototypes, api changes, and support for the client.
-// License: MIT
-// ------------------------------------------------
-(function(define) {
-
-"use strict";
-
-define(function(require, exports, module) {
-
-  // Initialize arrays to hold queue elements.
-  var PriorityQueue = function(size) {
-    this.slots = [];
-    this.queueSize = Math.max(+size | 0, 1);
-    for (var i = 0; i < this.queueSize; i += 1) {
-      this.slots.push([]);
-    }
-  };
-
-  PriorityQueue.prototype = {
-
-    total: null,
-
-    // Calculates the size of the queue, and sets
-    // the value to total.
-    size: function() {
-      if (this.total === null) {
-        this.total = 0;
-        for (var i = 0; i < this.queueSize; i += 1) {
-          this.total += this.slots[i].length;
-        }
-      }
-      return this.total;
-    },
-
-    // Clears the cache for total and adds an
-    // object to the queue, based on an optional priority.
-    enqueue: function(obj, priority) {
-      priority = priority && +priority | 0 || 0;
-      this.total = null;
-      if (priority) {
-        var priorityOrig = priority;
-        if (priority < 0 || priority >= this.queueSize) {
-          priority = (this.size - 1);
-        }
-      }
-      this.slots[priority].push(obj);
-    },
-
-    // Clears the cache for total and removes an object
-    // from the queue.
-    dequeue: function() {
-      var obj = null, i, sl = this.slots.length;
-      this.total = null;
-      for (i = 0; i < sl; i += 1) {
-        if (this.slots[i].length) {
-          obj = this.slots[i].shift();
-          break;
-        }
-      }
-      return obj;
-    }
-
-  };
-
-  // Constructor for a new pool.
-  var Pool = function(options) {
-    if (!(this instanceof Pool)) return new Pool(options);
-    this.idleTimeoutMillis = options.idleTimeoutMillis  || 30000;
-    this.reapInterval      = options.reapIntervalMillis || 1000;
-    this.destroyHandler    = options.destroy || function() {};
-    this.refreshIdle       = ('refreshIdle' in options) ? options.refreshIdle : true;
-    this.availableObjects  = [];
-    this.waitingClients    = new PriorityQueue(options.priorityRange || 1);
-    this.create            = options.create || (function() {
-      throw new Error('A create method must be defined for the connection pool.');
-    })();
-
-    // If a validate method is provided, use that instead of the default.
-    if (options.validate) this.validate = options.validate;
-
-    // Set the max & min's on the options.
-    var max = parseInt(options.max, 10);
-    var min = parseInt(options.min, 10);
-    this.max = Math.max(isNaN(max) ? 1 : max, 1);
-    this.min = Math.min(isNaN(min) ? 0 : min, this.max - 1);
-
-    // Ensure the minimum is created.
-    this.ensureMinimum();
-  };
-
-  Pool.prototype = {
-
-    count: 0,
-
-    draining: false,
-
-    removeIdleTimer: null,
-
-    removeIdleScheduled: false,
-
-    // Default validate.
-    validate: function() {
-      return true;
-    },
-
-    // Request a new client. The callback will be called,
-    // when a new client will be availabe, passing the client to it.
-    // Optionally, yoy may specify a priority of the caller if there are no
-    // available resources.  Lower numbers mean higher priority.
-    acquire: function(callback, priority) {
-      if (this.draining) return callback(new Error("Pool is draining and cannot accept work"));
-      this.waitingClients.enqueue(callback, priority);
-      this.dispense();
-      return (this.count < this.max);
-    },
-
-    // Return the client to the pool, in case it is no longer required.
-    release: function(obj, callback) {
-      // Check to see if this object has already been released (i.e., is back in the pool of availableObjects)
-      if (this.availableObjects.some(function(objWithTimeout) {
-        return (objWithTimeout.obj === obj);
-      })) {
-        if (callback) callback(new Error('Release called multiple times on the same object'));
-        return;
-      }
-      var objWithTimeout = {
-        obj: obj,
-        timeout: (new Date().getTime() + this.idleTimeoutMillis)
-      };
-      this.availableObjects.push(objWithTimeout);
-      this.dispense();
-      this.scheduleRemoveIdle();
-      if (callback) callback(null);
-    },
-
-    // Try to get a new client to work, and clean up pool unused (idle) items.
-    //
-    // - If there are available clients waiting, shift the first one out (LIFO),
-    //   and call its callback.
-    // - If there are no waiting clients, try to create one if it won't exceed
-    //   the maximum number of clients.
-    // - If creating a new client would exceed the maximum, add the client to
-    //   the wait list.
-    dispense: function() {
-      var obj = null,
-        objWithTimeout = null,
-        err = null,
-        clientCb = null,
-        waitingCount = this.waitingClients.size();
-
-      if (waitingCount > 0) {
-        while (this.availableObjects.length > 0) {
-          objWithTimeout = this.availableObjects[0];
-          if (!this.validate(objWithTimeout.obj)) {
-            this.destroy(objWithTimeout.obj);
-            continue;
-          }
-          this.availableObjects.shift();
-          clientCb = this.waitingClients.dequeue();
-          return clientCb(err, objWithTimeout.obj);
-        }
-        if (this.count < this.max) {
-          this.createResource();
-        }
-      }
-    },
-
-    // Disallow any new requests and let the request backlog dissapate,
-    // Setting the `draining` flag so as to let any additional work on the queue
-    // dissapate.
-    drain: function(callback) {
-      this.draining = true;
-      var pool = this;
-      var checking = function() {
-        if (pool.waitingClients.size() > 0 || pool.availableObjects.length != pool.count) {
-          setTimeout(checking, 100);
-        } else {
-          if (callback) callback();
-        }
-      };
-      checking();
-    },
-
-    // Forcibly destroys all clients regardless of timeout. Intended to be
-    // invoked as part of a drain. Does not prevent the creation of new
-    // clients as a result of subsequent calls to acquire.
-    //
-    // Note that if this.min > 0, the pool will destroy all idle resources
-    // in the pool, but replace them with newly created resources up to the
-    // specified this.min value.  If this is not desired, set this.min
-    // to zero before calling destroyAllNow()
-    destroyAllNow: function(callback) {
-      var willDie = this.availableObjects;
-      this.availableObjects = [];
-      var obj = willDie.shift();
-      while (obj !== null && obj !== undefined) {
-        this.destroy(obj.obj);
-        obj = willDie.shift();
-      }
-      this.removeIdleScheduled = false;
-      clearTimeout(this.removeIdleTimer);
-      if (callback) callback();
-    },
-
-    // Decorates a function to use a acquired client from the object pool when called.
-    pooled: function(decorated, priority) {
-      var pool = this;
-      return function() {
-        var callerArgs = arguments;
-        var callerCallback = callerArgs[callerArgs.length - 1];
-        var callerHasCallback = typeof callerCallback === 'function';
-        pool.acquire(function(err, client) {
-          if (err) {
-            if (callerHasCallback) callerCallback(err, null);
-            return;
-          }
-          var args = [client].concat(slice.call(callerArgs, 0, callerHasCallback ? -1 : undefined));
-          args.push(function() {
-            pool.release.call(pool, client);
-            if (callerHasCallback) callerCallback.apply(null, arguments);
-          });
-          decorated.apply(null, args);
-        }, priority);
-      };
-    },
-
-    // Request the client to be destroyed. The factory's destroy handler
-    // will also be called. This should be called within an acquire()
-    // block as an alternative to release().
-    destroy: function(obj) {
-      this.count -= 1;
-      this.availableObjects = this.availableObjects.filter(function(objWithTimeout) {
-        return (objWithTimeout.obj !== obj);
-      });
-      this.destroyHandler(obj);
-      this.ensureMinimum();
-    },
-
-    // Checks and removes the available (idle) clients that have timed out.
-    removeIdle: function() {
-      var toRemove = [],
-        now = new Date().getTime(),
-        i, availableLength, tr, timeout;
-
-      this.removeIdleScheduled = false;
-
-      // Go through the available (idle) items,
-      // check if they have timed out
-      for (i = 0, availableLength = this.availableObjects.length; i < availableLength && (this.refreshIdle || (this.count - this.min > toRemove.length)); i += 1) {
-        timeout = this.availableObjects[i].timeout;
-        if (now >= timeout) {
-          // Client timed out, so destroy it.
-          toRemove.push(this.availableObjects[i].obj);
-        }
-      }
-
-      for (i = 0, tr = toRemove.length; i < tr; i += 1) {
-        this.destroy(toRemove[i]);
-      }
-
-      // Replace the available items with the ones to keep.
-      availableLength = this.availableObjects.length;
-
-      if (availableLength > 0) {
-        this.scheduleRemoveIdle();
-      }
-    },
-
-    // Schedule removal of idle items in the pool.
-    // More schedules cannot run concurrently.
-    scheduleRemoveIdle: function() {
-      if (!this.removeIdleScheduled) {
-        this.removeIdleScheduled = true;
-        var pool = this;
-        this.removeIdleTimer = setTimeout(function() {
-          pool.removeIdle.call(pool);
-        }, this.reapInterval);
-      }
-    },
-
-    // Creates a new resource, adding an object to the pool
-    createResource: function() {
-      var pool = this;
-      this.count += 1;
-      this.create(function(err, obj) {
-        var clientCb = pool.waitingClients.dequeue();
-        if (err) {
-          pool.count -= 1;
-          if (clientCb) clientCb(err, null);
-          setTimeout(function() {
-            pool.dispense.call(pool);
-          }, 0);
-        } else {
-          if (clientCb) return clientCb(null, obj);
-          pool.release(obj);
-        }
-      });
-    },
-
-    // If the client isn't in the process of draining, this ensures
-    // that the minimum number of resources are always around.
-    ensureMinimum: function() {
-      var i, diff;
-      if (!this.draining && (this.count < this.min)) {
-        diff = this.min - this.count;
-        for (i = 0; i < diff; i++) {
-          this.createResource();
-        }
-      }
-    }
-  };
-
-  var slice = Array.prototype.slice;
-
-  module.exports = {
-
-    // Export the `Pool` constructor.
-    Pool: Pool,
-
-    // Export the PriorityQueue constructor, in case anyone wants to fiddle with that.
-    PriorityQueue: PriorityQueue
-
-  };
-
-});
-
-})(
-  typeof define === 'function' && define.amd ? define : function (factory) { factory(require, exports, module); }
-);
-},{}],62:[function(require,module,exports){
+},{"./assert.js":18,"./es5.js":27,"./global.js":31}],55:[function(require,module,exports){
 (function (global){
 /**
  * @license
@@ -15097,1329 +16484,81 @@ define(function(require, exports, module) {
 }.call(this));
 
 }).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],63:[function(require,module,exports){
-/**
- * The buffer module from node.js, for the browser.
- *
- * Author:   Feross Aboukhadijeh <feross@feross.org> <http://feross.org>
- * License:  MIT
- *
- * `npm install buffer`
- */
+},{}],56:[function(require,module,exports){
+//     trigger-then.js 0.1.1
+//     (c) 2013 Tim Griesser
+//     trigger-then may be freely distributed under the MIT license.
 
-var base64 = require('base64-js')
-var ieee754 = require('ieee754')
-
-exports.Buffer = Buffer
-exports.SlowBuffer = Buffer
-exports.INSPECT_MAX_BYTES = 50
-Buffer.poolSize = 8192
-
-/**
- * If `Buffer._useTypedArrays`:
- *   === true    Use Uint8Array implementation (fastest)
- *   === false   Use Object implementation (compatible down to IE6)
- */
-Buffer._useTypedArrays = (function () {
-   // Detect if browser supports Typed Arrays. Supported browsers are IE 10+,
-   // Firefox 4+, Chrome 7+, Safari 5.1+, Opera 11.6+, iOS 4.2+.
-  if (typeof Uint8Array === 'undefined' || typeof ArrayBuffer === 'undefined')
-    return false
-
-  // Does the browser support adding properties to `Uint8Array` instances? If
-  // not, then that's the same as no `Uint8Array` support. We need to be able to
-  // add all the node Buffer API methods.
-  // Relevant Firefox bug: https://bugzilla.mozilla.org/show_bug.cgi?id=695438
-  try {
-    var arr = new Uint8Array(0)
-    arr.foo = function () { return 42 }
-    return 42 === arr.foo() &&
-        typeof arr.subarray === 'function' // Chrome 9-10 lack `subarray`
-  } catch (e) {
-    return false
-  }
-})()
-
-/**
- * Class: Buffer
- * =============
- *
- * The Buffer constructor returns instances of `Uint8Array` that are augmented
- * with function properties for all the node `Buffer` API functions. We use
- * `Uint8Array` so that square bracket notation works as expected -- it returns
- * a single octet.
- *
- * By augmenting the instances, we can avoid modifying the `Uint8Array`
- * prototype.
- */
-function Buffer (subject, encoding, noZero) {
-  if (!(this instanceof Buffer))
-    return new Buffer(subject, encoding, noZero)
-
-  var type = typeof subject
-
-  // Workaround: node's base64 implementation allows for non-padded strings
-  // while base64-js does not.
-  if (encoding === 'base64' && type === 'string') {
-    subject = stringtrim(subject)
-    while (subject.length % 4 !== 0) {
-      subject = subject + '='
-    }
-  }
-
-  // Find the length
-  var length
-  if (type === 'number')
-    length = coerce(subject)
-  else if (type === 'string')
-    length = Buffer.byteLength(subject, encoding)
-  else if (type === 'object')
-    length = coerce(subject.length) // Assume object is an array
-  else
-    throw new Error('First argument needs to be a number, array or string.')
-
-  var buf
-  if (Buffer._useTypedArrays) {
-    // Preferred: Return an augmented `Uint8Array` instance for best performance
-    buf = augment(new Uint8Array(length))
+// Exports the function which mixes `triggerThen`
+// into the specified `Backbone` copy's `Events` object,
+// using the promise-lib's "all" implementation provided
+// in the second argument.
+(function(mixinFn) {
+  if (typeof exports === "object") {
+    module.exports = mixinFn;
+  } else if (typeof define === "function" && define.amd) {
+    define('trigger-then', [], function() { return mixinFn; });
   } else {
-    // Fallback: Return THIS instance of Buffer (created by `new`)
-    buf = this
-    buf.length = length
-    buf._isBuffer = true
+    this.triggerThen = mixinFn;
   }
+}).call(this, function(Backbone, PromiseLib) {
 
-  var i
-  if (Buffer._useTypedArrays && typeof Uint8Array === 'function' &&
-      subject instanceof Uint8Array) {
-    // Speed optimization -- use set if we're copying from a Uint8Array
-    buf._set(subject)
-  } else if (isArrayish(subject)) {
-    // Treat array-ish objects as a byte array
-    for (i = 0; i < length; i++) {
-      if (Buffer.isBuffer(subject))
-        buf[i] = subject.readUInt8(i)
-      else
-        buf[i] = subject[i]
+  var Events = Backbone.Events;
+  var push   = Array.prototype.push;
+  var slice  = Array.prototype.slice;
+  var eventSplitter = /\s+/;
+
+  // A difficult-to-believe, but optimized internal dispatch function for
+  // triggering events. Tries to keep the usual cases speedy (most internal
+  // Backbone events have 3 arguments). Returns an array containing all of the
+  // event trigger calls, in case any return deferreds.
+  var triggerEvents = function(events, args) {
+    var ev, i = -1, l = events.length, a1 = args[0], a2 = args[1], a3 = args[2];
+    var dfds = [];
+    switch (args.length) {
+      case 0: while (++i < l) dfds.push((ev = events[i]).callback.call(ev.ctx)); return dfds;
+      case 1: while (++i < l) dfds.push((ev = events[i]).callback.call(ev.ctx, a1)); return dfds;
+      case 2: while (++i < l) dfds.push((ev = events[i]).callback.call(ev.ctx, a1, a2)); return dfds;
+      case 3: while (++i < l) dfds.push((ev = events[i]).callback.call(ev.ctx, a1, a2, a3)); return dfds;
+      default: while (++i < l) dfds.push((ev = events[i]).callback.apply(ev.ctx, args)); return dfds;
     }
-  } else if (type === 'string') {
-    buf.write(subject, 0, encoding)
-  } else if (type === 'number' && !Buffer._useTypedArrays && !noZero) {
-    for (i = 0; i < length; i++) {
-      buf[i] = 0
+  };
+
+  // Fires events as `trigger` normally would, but assumes that some of the `return`
+  // values from the events may be promises, and and returns a promise when all of the
+  // events are resolved.
+  var triggerThen = Events.triggerThen = function(name) {
+    if (!this._events) return PromiseLib.all([]);
+    var names = [name];
+    var args = slice.call(arguments, 1);
+    var dfds = [];
+    var events = [];
+    if (eventSplitter.test(names[0])) names = names[0].split(eventSplitter);
+    for (var i = 0, l = names.length; i < l; i++) {
+      push.apply(events, this._events[names[i]]);
     }
-  }
+    var allEvents = this._events.all;
 
-  return buf
-}
-
-// STATIC METHODS
-// ==============
-
-Buffer.isEncoding = function (encoding) {
-  switch (String(encoding).toLowerCase()) {
-    case 'hex':
-    case 'utf8':
-    case 'utf-8':
-    case 'ascii':
-    case 'binary':
-    case 'base64':
-    case 'raw':
-    case 'ucs2':
-    case 'ucs-2':
-    case 'utf16le':
-    case 'utf-16le':
-      return true
-    default:
-      return false
-  }
-}
-
-Buffer.isBuffer = function (b) {
-  return !!(b !== null && b !== undefined && b._isBuffer)
-}
-
-Buffer.byteLength = function (str, encoding) {
-  var ret
-  str = str + ''
-  switch (encoding || 'utf8') {
-    case 'hex':
-      ret = str.length / 2
-      break
-    case 'utf8':
-    case 'utf-8':
-      ret = utf8ToBytes(str).length
-      break
-    case 'ascii':
-    case 'binary':
-    case 'raw':
-      ret = str.length
-      break
-    case 'base64':
-      ret = base64ToBytes(str).length
-      break
-    case 'ucs2':
-    case 'ucs-2':
-    case 'utf16le':
-    case 'utf-16le':
-      ret = str.length * 2
-      break
-    default:
-      throw new Error('Unknown encoding')
-  }
-  return ret
-}
-
-Buffer.concat = function (list, totalLength) {
-  assert(isArray(list), 'Usage: Buffer.concat(list, [totalLength])\n' +
-      'list should be an Array.')
-
-  if (list.length === 0) {
-    return new Buffer(0)
-  } else if (list.length === 1) {
-    return list[0]
-  }
-
-  var i
-  if (typeof totalLength !== 'number') {
-    totalLength = 0
-    for (i = 0; i < list.length; i++) {
-      totalLength += list[i].length
+    // Wrap in a try/catch to reject the promise if any errors are thrown within the handlers.
+    try  {
+      if (events) push.apply(dfds, triggerEvents(events, args));
+      if (allEvents) push.apply(dfds, triggerEvents(allEvents, arguments));
+    } catch (e) {
+      return PromiseLib.reject(e);
     }
+    return PromiseLib.all(dfds);
+  };
+
+  // Mixin `triggerThen` to the appropriate objects and prototypes.
+  Backbone.triggerThen = triggerThen;
+
+  var objs = ['Model', 'Collection', 'Router', 'View', 'History'];
+
+  for (var i=0, l=objs.length; i<l; i++) {
+    Backbone[objs[i]].prototype.triggerThen = triggerThen;
   }
-
-  var buf = new Buffer(totalLength)
-  var pos = 0
-  for (i = 0; i < list.length; i++) {
-    var item = list[i]
-    item.copy(buf, pos)
-    pos += item.length
-  }
-  return buf
-}
-
-// BUFFER INSTANCE METHODS
-// =======================
-
-function _hexWrite (buf, string, offset, length) {
-  offset = Number(offset) || 0
-  var remaining = buf.length - offset
-  if (!length) {
-    length = remaining
-  } else {
-    length = Number(length)
-    if (length > remaining) {
-      length = remaining
-    }
-  }
-
-  // must be an even number of digits
-  var strLen = string.length
-  assert(strLen % 2 === 0, 'Invalid hex string')
-
-  if (length > strLen / 2) {
-    length = strLen / 2
-  }
-  for (var i = 0; i < length; i++) {
-    var byte = parseInt(string.substr(i * 2, 2), 16)
-    assert(!isNaN(byte), 'Invalid hex string')
-    buf[offset + i] = byte
-  }
-  Buffer._charsWritten = i * 2
-  return i
-}
-
-function _utf8Write (buf, string, offset, length) {
-  var charsWritten = Buffer._charsWritten =
-    blitBuffer(utf8ToBytes(string), buf, offset, length)
-  return charsWritten
-}
-
-function _asciiWrite (buf, string, offset, length) {
-  var charsWritten = Buffer._charsWritten =
-    blitBuffer(asciiToBytes(string), buf, offset, length)
-  return charsWritten
-}
-
-function _binaryWrite (buf, string, offset, length) {
-  return _asciiWrite(buf, string, offset, length)
-}
-
-function _base64Write (buf, string, offset, length) {
-  var charsWritten = Buffer._charsWritten =
-    blitBuffer(base64ToBytes(string), buf, offset, length)
-  return charsWritten
-}
-
-function _utf16leWrite (buf, string, offset, length) {
-  var charsWritten = Buffer._charsWritten =
-    blitBuffer(utf16leToBytes(string), buf, offset, length)
-  return charsWritten
-}
-
-Buffer.prototype.write = function (string, offset, length, encoding) {
-  // Support both (string, offset, length, encoding)
-  // and the legacy (string, encoding, offset, length)
-  if (isFinite(offset)) {
-    if (!isFinite(length)) {
-      encoding = length
-      length = undefined
-    }
-  } else {  // legacy
-    var swap = encoding
-    encoding = offset
-    offset = length
-    length = swap
-  }
-
-  offset = Number(offset) || 0
-  var remaining = this.length - offset
-  if (!length) {
-    length = remaining
-  } else {
-    length = Number(length)
-    if (length > remaining) {
-      length = remaining
-    }
-  }
-  encoding = String(encoding || 'utf8').toLowerCase()
-
-  var ret
-  switch (encoding) {
-    case 'hex':
-      ret = _hexWrite(this, string, offset, length)
-      break
-    case 'utf8':
-    case 'utf-8':
-      ret = _utf8Write(this, string, offset, length)
-      break
-    case 'ascii':
-      ret = _asciiWrite(this, string, offset, length)
-      break
-    case 'binary':
-      ret = _binaryWrite(this, string, offset, length)
-      break
-    case 'base64':
-      ret = _base64Write(this, string, offset, length)
-      break
-    case 'ucs2':
-    case 'ucs-2':
-    case 'utf16le':
-    case 'utf-16le':
-      ret = _utf16leWrite(this, string, offset, length)
-      break
-    default:
-      throw new Error('Unknown encoding')
-  }
-  return ret
-}
-
-Buffer.prototype.toString = function (encoding, start, end) {
-  var self = this
-
-  encoding = String(encoding || 'utf8').toLowerCase()
-  start = Number(start) || 0
-  end = (end !== undefined)
-    ? Number(end)
-    : end = self.length
-
-  // Fastpath empty strings
-  if (end === start)
-    return ''
-
-  var ret
-  switch (encoding) {
-    case 'hex':
-      ret = _hexSlice(self, start, end)
-      break
-    case 'utf8':
-    case 'utf-8':
-      ret = _utf8Slice(self, start, end)
-      break
-    case 'ascii':
-      ret = _asciiSlice(self, start, end)
-      break
-    case 'binary':
-      ret = _binarySlice(self, start, end)
-      break
-    case 'base64':
-      ret = _base64Slice(self, start, end)
-      break
-    case 'ucs2':
-    case 'ucs-2':
-    case 'utf16le':
-    case 'utf-16le':
-      ret = _utf16leSlice(self, start, end)
-      break
-    default:
-      throw new Error('Unknown encoding')
-  }
-  return ret
-}
-
-Buffer.prototype.toJSON = function () {
-  return {
-    type: 'Buffer',
-    data: Array.prototype.slice.call(this._arr || this, 0)
-  }
-}
-
-// copy(targetBuffer, targetStart=0, sourceStart=0, sourceEnd=buffer.length)
-Buffer.prototype.copy = function (target, target_start, start, end) {
-  var source = this
-
-  if (!start) start = 0
-  if (!end && end !== 0) end = this.length
-  if (!target_start) target_start = 0
-
-  // Copy 0 bytes; we're done
-  if (end === start) return
-  if (target.length === 0 || source.length === 0) return
-
-  // Fatal error conditions
-  assert(end >= start, 'sourceEnd < sourceStart')
-  assert(target_start >= 0 && target_start < target.length,
-      'targetStart out of bounds')
-  assert(start >= 0 && start < source.length, 'sourceStart out of bounds')
-  assert(end >= 0 && end <= source.length, 'sourceEnd out of bounds')
-
-  // Are we oob?
-  if (end > this.length)
-    end = this.length
-  if (target.length - target_start < end - start)
-    end = target.length - target_start + start
-
-  // copy!
-  for (var i = 0; i < end - start; i++)
-    target[i + target_start] = this[i + start]
-}
-
-function _base64Slice (buf, start, end) {
-  if (start === 0 && end === buf.length) {
-    return base64.fromByteArray(buf)
-  } else {
-    return base64.fromByteArray(buf.slice(start, end))
-  }
-}
-
-function _utf8Slice (buf, start, end) {
-  var res = ''
-  var tmp = ''
-  end = Math.min(buf.length, end)
-
-  for (var i = start; i < end; i++) {
-    if (buf[i] <= 0x7F) {
-      res += decodeUtf8Char(tmp) + String.fromCharCode(buf[i])
-      tmp = ''
-    } else {
-      tmp += '%' + buf[i].toString(16)
-    }
-  }
-
-  return res + decodeUtf8Char(tmp)
-}
-
-function _asciiSlice (buf, start, end) {
-  var ret = ''
-  end = Math.min(buf.length, end)
-
-  for (var i = start; i < end; i++)
-    ret += String.fromCharCode(buf[i])
-  return ret
-}
-
-function _binarySlice (buf, start, end) {
-  return _asciiSlice(buf, start, end)
-}
-
-function _hexSlice (buf, start, end) {
-  var len = buf.length
-
-  if (!start || start < 0) start = 0
-  if (!end || end < 0 || end > len) end = len
-
-  var out = ''
-  for (var i = start; i < end; i++) {
-    out += toHex(buf[i])
-  }
-  return out
-}
-
-function _utf16leSlice (buf, start, end) {
-  var bytes = buf.slice(start, end)
-  var res = ''
-  for (var i = 0; i < bytes.length; i += 2) {
-    res += String.fromCharCode(bytes[i] + bytes[i+1] * 256)
-  }
-  return res
-}
-
-Buffer.prototype.slice = function (start, end) {
-  var len = this.length
-  start = clamp(start, len, 0)
-  end = clamp(end, len, len)
-
-  if (Buffer._useTypedArrays) {
-    return augment(this.subarray(start, end))
-  } else {
-    var sliceLen = end - start
-    var newBuf = new Buffer(sliceLen, undefined, true)
-    for (var i = 0; i < sliceLen; i++) {
-      newBuf[i] = this[i + start]
-    }
-    return newBuf
-  }
-}
-
-// `get` will be removed in Node 0.13+
-Buffer.prototype.get = function (offset) {
-  console.log('.get() is deprecated. Access using array indexes instead.')
-  return this.readUInt8(offset)
-}
-
-// `set` will be removed in Node 0.13+
-Buffer.prototype.set = function (v, offset) {
-  console.log('.set() is deprecated. Access using array indexes instead.')
-  return this.writeUInt8(v, offset)
-}
-
-Buffer.prototype.readUInt8 = function (offset, noAssert) {
-  if (!noAssert) {
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset < this.length, 'Trying to read beyond buffer length')
-  }
-
-  if (offset >= this.length)
-    return
-
-  return this[offset]
-}
-
-function _readUInt16 (buf, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 1 < buf.length, 'Trying to read beyond buffer length')
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  var val
-  if (littleEndian) {
-    val = buf[offset]
-    if (offset + 1 < len)
-      val |= buf[offset + 1] << 8
-  } else {
-    val = buf[offset] << 8
-    if (offset + 1 < len)
-      val |= buf[offset + 1]
-  }
-  return val
-}
-
-Buffer.prototype.readUInt16LE = function (offset, noAssert) {
-  return _readUInt16(this, offset, true, noAssert)
-}
-
-Buffer.prototype.readUInt16BE = function (offset, noAssert) {
-  return _readUInt16(this, offset, false, noAssert)
-}
-
-function _readUInt32 (buf, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 3 < buf.length, 'Trying to read beyond buffer length')
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  var val
-  if (littleEndian) {
-    if (offset + 2 < len)
-      val = buf[offset + 2] << 16
-    if (offset + 1 < len)
-      val |= buf[offset + 1] << 8
-    val |= buf[offset]
-    if (offset + 3 < len)
-      val = val + (buf[offset + 3] << 24 >>> 0)
-  } else {
-    if (offset + 1 < len)
-      val = buf[offset + 1] << 16
-    if (offset + 2 < len)
-      val |= buf[offset + 2] << 8
-    if (offset + 3 < len)
-      val |= buf[offset + 3]
-    val = val + (buf[offset] << 24 >>> 0)
-  }
-  return val
-}
-
-Buffer.prototype.readUInt32LE = function (offset, noAssert) {
-  return _readUInt32(this, offset, true, noAssert)
-}
-
-Buffer.prototype.readUInt32BE = function (offset, noAssert) {
-  return _readUInt32(this, offset, false, noAssert)
-}
-
-Buffer.prototype.readInt8 = function (offset, noAssert) {
-  if (!noAssert) {
-    assert(offset !== undefined && offset !== null,
-        'missing offset')
-    assert(offset < this.length, 'Trying to read beyond buffer length')
-  }
-
-  if (offset >= this.length)
-    return
-
-  var neg = this[offset] & 0x80
-  if (neg)
-    return (0xff - this[offset] + 1) * -1
-  else
-    return this[offset]
-}
-
-function _readInt16 (buf, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 1 < buf.length, 'Trying to read beyond buffer length')
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  var val = _readUInt16(buf, offset, littleEndian, true)
-  var neg = val & 0x8000
-  if (neg)
-    return (0xffff - val + 1) * -1
-  else
-    return val
-}
-
-Buffer.prototype.readInt16LE = function (offset, noAssert) {
-  return _readInt16(this, offset, true, noAssert)
-}
-
-Buffer.prototype.readInt16BE = function (offset, noAssert) {
-  return _readInt16(this, offset, false, noAssert)
-}
-
-function _readInt32 (buf, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 3 < buf.length, 'Trying to read beyond buffer length')
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  var val = _readUInt32(buf, offset, littleEndian, true)
-  var neg = val & 0x80000000
-  if (neg)
-    return (0xffffffff - val + 1) * -1
-  else
-    return val
-}
-
-Buffer.prototype.readInt32LE = function (offset, noAssert) {
-  return _readInt32(this, offset, true, noAssert)
-}
-
-Buffer.prototype.readInt32BE = function (offset, noAssert) {
-  return _readInt32(this, offset, false, noAssert)
-}
-
-function _readFloat (buf, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset + 3 < buf.length, 'Trying to read beyond buffer length')
-  }
-
-  return ieee754.read(buf, offset, littleEndian, 23, 4)
-}
-
-Buffer.prototype.readFloatLE = function (offset, noAssert) {
-  return _readFloat(this, offset, true, noAssert)
-}
-
-Buffer.prototype.readFloatBE = function (offset, noAssert) {
-  return _readFloat(this, offset, false, noAssert)
-}
-
-function _readDouble (buf, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset + 7 < buf.length, 'Trying to read beyond buffer length')
-  }
-
-  return ieee754.read(buf, offset, littleEndian, 52, 8)
-}
-
-Buffer.prototype.readDoubleLE = function (offset, noAssert) {
-  return _readDouble(this, offset, true, noAssert)
-}
-
-Buffer.prototype.readDoubleBE = function (offset, noAssert) {
-  return _readDouble(this, offset, false, noAssert)
-}
-
-Buffer.prototype.writeUInt8 = function (value, offset, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset < this.length, 'trying to write beyond buffer length')
-    verifuint(value, 0xff)
-  }
-
-  if (offset >= this.length) return
-
-  this[offset] = value
-}
-
-function _writeUInt16 (buf, value, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 1 < buf.length, 'trying to write beyond buffer length')
-    verifuint(value, 0xffff)
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  for (var i = 0, j = Math.min(len - offset, 2); i < j; i++) {
-    buf[offset + i] =
-        (value & (0xff << (8 * (littleEndian ? i : 1 - i)))) >>>
-            (littleEndian ? i : 1 - i) * 8
-  }
-}
-
-Buffer.prototype.writeUInt16LE = function (value, offset, noAssert) {
-  _writeUInt16(this, value, offset, true, noAssert)
-}
-
-Buffer.prototype.writeUInt16BE = function (value, offset, noAssert) {
-  _writeUInt16(this, value, offset, false, noAssert)
-}
-
-function _writeUInt32 (buf, value, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 3 < buf.length, 'trying to write beyond buffer length')
-    verifuint(value, 0xffffffff)
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  for (var i = 0, j = Math.min(len - offset, 4); i < j; i++) {
-    buf[offset + i] =
-        (value >>> (littleEndian ? i : 3 - i) * 8) & 0xff
-  }
-}
-
-Buffer.prototype.writeUInt32LE = function (value, offset, noAssert) {
-  _writeUInt32(this, value, offset, true, noAssert)
-}
-
-Buffer.prototype.writeUInt32BE = function (value, offset, noAssert) {
-  _writeUInt32(this, value, offset, false, noAssert)
-}
-
-Buffer.prototype.writeInt8 = function (value, offset, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset < this.length, 'Trying to write beyond buffer length')
-    verifsint(value, 0x7f, -0x80)
-  }
-
-  if (offset >= this.length)
-    return
-
-  if (value >= 0)
-    this.writeUInt8(value, offset, noAssert)
-  else
-    this.writeUInt8(0xff + value + 1, offset, noAssert)
-}
-
-function _writeInt16 (buf, value, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 1 < buf.length, 'Trying to write beyond buffer length')
-    verifsint(value, 0x7fff, -0x8000)
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  if (value >= 0)
-    _writeUInt16(buf, value, offset, littleEndian, noAssert)
-  else
-    _writeUInt16(buf, 0xffff + value + 1, offset, littleEndian, noAssert)
-}
-
-Buffer.prototype.writeInt16LE = function (value, offset, noAssert) {
-  _writeInt16(this, value, offset, true, noAssert)
-}
-
-Buffer.prototype.writeInt16BE = function (value, offset, noAssert) {
-  _writeInt16(this, value, offset, false, noAssert)
-}
-
-function _writeInt32 (buf, value, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 3 < buf.length, 'Trying to write beyond buffer length')
-    verifsint(value, 0x7fffffff, -0x80000000)
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  if (value >= 0)
-    _writeUInt32(buf, value, offset, littleEndian, noAssert)
-  else
-    _writeUInt32(buf, 0xffffffff + value + 1, offset, littleEndian, noAssert)
-}
-
-Buffer.prototype.writeInt32LE = function (value, offset, noAssert) {
-  _writeInt32(this, value, offset, true, noAssert)
-}
-
-Buffer.prototype.writeInt32BE = function (value, offset, noAssert) {
-  _writeInt32(this, value, offset, false, noAssert)
-}
-
-function _writeFloat (buf, value, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 3 < buf.length, 'Trying to write beyond buffer length')
-    verifIEEE754(value, 3.4028234663852886e+38, -3.4028234663852886e+38)
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  ieee754.write(buf, value, offset, littleEndian, 23, 4)
-}
-
-Buffer.prototype.writeFloatLE = function (value, offset, noAssert) {
-  _writeFloat(this, value, offset, true, noAssert)
-}
-
-Buffer.prototype.writeFloatBE = function (value, offset, noAssert) {
-  _writeFloat(this, value, offset, false, noAssert)
-}
-
-function _writeDouble (buf, value, offset, littleEndian, noAssert) {
-  if (!noAssert) {
-    assert(value !== undefined && value !== null, 'missing value')
-    assert(typeof littleEndian === 'boolean', 'missing or invalid endian')
-    assert(offset !== undefined && offset !== null, 'missing offset')
-    assert(offset + 7 < buf.length,
-        'Trying to write beyond buffer length')
-    verifIEEE754(value, 1.7976931348623157E+308, -1.7976931348623157E+308)
-  }
-
-  var len = buf.length
-  if (offset >= len)
-    return
-
-  ieee754.write(buf, value, offset, littleEndian, 52, 8)
-}
-
-Buffer.prototype.writeDoubleLE = function (value, offset, noAssert) {
-  _writeDouble(this, value, offset, true, noAssert)
-}
-
-Buffer.prototype.writeDoubleBE = function (value, offset, noAssert) {
-  _writeDouble(this, value, offset, false, noAssert)
-}
-
-// fill(value, start=0, end=buffer.length)
-Buffer.prototype.fill = function (value, start, end) {
-  if (!value) value = 0
-  if (!start) start = 0
-  if (!end) end = this.length
-
-  if (typeof value === 'string') {
-    value = value.charCodeAt(0)
-  }
-
-  assert(typeof value === 'number' && !isNaN(value), 'value is not a number')
-  assert(end >= start, 'end < start')
-
-  // Fill 0 bytes; we're done
-  if (end === start) return
-  if (this.length === 0) return
-
-  assert(start >= 0 && start < this.length, 'start out of bounds')
-  assert(end >= 0 && end <= this.length, 'end out of bounds')
-
-  for (var i = start; i < end; i++) {
-    this[i] = value
-  }
-}
-
-Buffer.prototype.inspect = function () {
-  var out = []
-  var len = this.length
-  for (var i = 0; i < len; i++) {
-    out[i] = toHex(this[i])
-    if (i === exports.INSPECT_MAX_BYTES) {
-      out[i + 1] = '...'
-      break
-    }
-  }
-  return '<Buffer ' + out.join(' ') + '>'
-}
-
-/**
- * Creates a new `ArrayBuffer` with the *copied* memory of the buffer instance.
- * Added in Node 0.12. Only available in browsers that support ArrayBuffer.
- */
-Buffer.prototype.toArrayBuffer = function () {
-  if (typeof Uint8Array === 'function') {
-    if (Buffer._useTypedArrays) {
-      return (new Buffer(this)).buffer
-    } else {
-      var buf = new Uint8Array(this.length)
-      for (var i = 0, len = buf.length; i < len; i += 1)
-        buf[i] = this[i]
-      return buf.buffer
-    }
-  } else {
-    throw new Error('Buffer.toArrayBuffer not supported in this browser')
-  }
-}
-
-// HELPER FUNCTIONS
-// ================
-
-function stringtrim (str) {
-  if (str.trim) return str.trim()
-  return str.replace(/^\s+|\s+$/g, '')
-}
-
-var BP = Buffer.prototype
-
-/**
- * Augment the Uint8Array *instance* (not the class!) with Buffer methods
- */
-function augment (arr) {
-  arr._isBuffer = true
-
-  // save reference to original Uint8Array get/set methods before overwriting
-  arr._get = arr.get
-  arr._set = arr.set
-
-  // deprecated, will be removed in node 0.13+
-  arr.get = BP.get
-  arr.set = BP.set
-
-  arr.write = BP.write
-  arr.toString = BP.toString
-  arr.toLocaleString = BP.toString
-  arr.toJSON = BP.toJSON
-  arr.copy = BP.copy
-  arr.slice = BP.slice
-  arr.readUInt8 = BP.readUInt8
-  arr.readUInt16LE = BP.readUInt16LE
-  arr.readUInt16BE = BP.readUInt16BE
-  arr.readUInt32LE = BP.readUInt32LE
-  arr.readUInt32BE = BP.readUInt32BE
-  arr.readInt8 = BP.readInt8
-  arr.readInt16LE = BP.readInt16LE
-  arr.readInt16BE = BP.readInt16BE
-  arr.readInt32LE = BP.readInt32LE
-  arr.readInt32BE = BP.readInt32BE
-  arr.readFloatLE = BP.readFloatLE
-  arr.readFloatBE = BP.readFloatBE
-  arr.readDoubleLE = BP.readDoubleLE
-  arr.readDoubleBE = BP.readDoubleBE
-  arr.writeUInt8 = BP.writeUInt8
-  arr.writeUInt16LE = BP.writeUInt16LE
-  arr.writeUInt16BE = BP.writeUInt16BE
-  arr.writeUInt32LE = BP.writeUInt32LE
-  arr.writeUInt32BE = BP.writeUInt32BE
-  arr.writeInt8 = BP.writeInt8
-  arr.writeInt16LE = BP.writeInt16LE
-  arr.writeInt16BE = BP.writeInt16BE
-  arr.writeInt32LE = BP.writeInt32LE
-  arr.writeInt32BE = BP.writeInt32BE
-  arr.writeFloatLE = BP.writeFloatLE
-  arr.writeFloatBE = BP.writeFloatBE
-  arr.writeDoubleLE = BP.writeDoubleLE
-  arr.writeDoubleBE = BP.writeDoubleBE
-  arr.fill = BP.fill
-  arr.inspect = BP.inspect
-  arr.toArrayBuffer = BP.toArrayBuffer
-
-  return arr
-}
-
-// slice(start, end)
-function clamp (index, len, defaultValue) {
-  if (typeof index !== 'number') return defaultValue
-  index = ~~index;  // Coerce to integer.
-  if (index >= len) return len
-  if (index >= 0) return index
-  index += len
-  if (index >= 0) return index
-  return 0
-}
-
-function coerce (length) {
-  // Coerce length to a number (possibly NaN), round up
-  // in case it's fractional (e.g. 123.456) then do a
-  // double negate to coerce a NaN to 0. Easy, right?
-  length = ~~Math.ceil(+length)
-  return length < 0 ? 0 : length
-}
-
-function isArray (subject) {
-  return (Array.isArray || function (subject) {
-    return Object.prototype.toString.call(subject) === '[object Array]'
-  })(subject)
-}
-
-function isArrayish (subject) {
-  return isArray(subject) || Buffer.isBuffer(subject) ||
-      subject && typeof subject === 'object' &&
-      typeof subject.length === 'number'
-}
-
-function toHex (n) {
-  if (n < 16) return '0' + n.toString(16)
-  return n.toString(16)
-}
-
-function utf8ToBytes (str) {
-  var byteArray = []
-  for (var i = 0; i < str.length; i++) {
-    var b = str.charCodeAt(i)
-    if (b <= 0x7F)
-      byteArray.push(str.charCodeAt(i))
-    else {
-      var start = i
-      if (b >= 0xD800 && b <= 0xDFFF) i++
-      var h = encodeURIComponent(str.slice(start, i+1)).substr(1).split('%')
-      for (var j = 0; j < h.length; j++)
-        byteArray.push(parseInt(h[j], 16))
-    }
-  }
-  return byteArray
-}
-
-function asciiToBytes (str) {
-  var byteArray = []
-  for (var i = 0; i < str.length; i++) {
-    // Node's code seems to be doing this and not & 0x7F..
-    byteArray.push(str.charCodeAt(i) & 0xFF)
-  }
-  return byteArray
-}
-
-function utf16leToBytes (str) {
-  var c, hi, lo
-  var byteArray = []
-  for (var i = 0; i < str.length; i++) {
-    c = str.charCodeAt(i)
-    hi = c >> 8
-    lo = c % 256
-    byteArray.push(lo)
-    byteArray.push(hi)
-  }
-
-  return byteArray
-}
-
-function base64ToBytes (str) {
-  return base64.toByteArray(str)
-}
-
-function blitBuffer (src, dst, offset, length) {
-  var pos
-  for (var i = 0; i < length; i++) {
-    if ((i + offset >= dst.length) || (i >= src.length))
-      break
-    dst[i + offset] = src[i]
-  }
-  return i
-}
-
-function decodeUtf8Char (str) {
-  try {
-    return decodeURIComponent(str)
-  } catch (err) {
-    return String.fromCharCode(0xFFFD) // UTF 8 invalid char
-  }
-}
-
-/*
- * We have to make sure that the value is a valid integer. This means that it
- * is non-negative. It has no fractional component and that it does not
- * exceed the maximum allowed value.
- */
-function verifuint (value, max) {
-  assert(typeof value === 'number', 'cannot write a non-number as a number')
-  assert(value >= 0,
-      'specified a negative value for writing an unsigned value')
-  assert(value <= max, 'value is larger than maximum value for type')
-  assert(Math.floor(value) === value, 'value has a fractional component')
-}
-
-function verifsint (value, max, min) {
-  assert(typeof value === 'number', 'cannot write a non-number as a number')
-  assert(value <= max, 'value larger than maximum allowed value')
-  assert(value >= min, 'value smaller than minimum allowed value')
-  assert(Math.floor(value) === value, 'value has a fractional component')
-}
-
-function verifIEEE754 (value, max, min) {
-  assert(typeof value === 'number', 'cannot write a non-number as a number')
-  assert(value <= max, 'value larger than maximum allowed value')
-  assert(value >= min, 'value smaller than minimum allowed value')
-}
-
-function assert (test, message) {
-  if (!test) throw new Error(message || 'Failed assertion')
-}
-
-},{"base64-js":64,"ieee754":65}],64:[function(require,module,exports){
-var lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-
-;(function (exports) {
-	'use strict';
-
-  var Arr = (typeof Uint8Array !== 'undefined')
-    ? Uint8Array
-    : Array
-
-	var ZERO   = '0'.charCodeAt(0)
-	var PLUS   = '+'.charCodeAt(0)
-	var SLASH  = '/'.charCodeAt(0)
-	var NUMBER = '0'.charCodeAt(0)
-	var LOWER  = 'a'.charCodeAt(0)
-	var UPPER  = 'A'.charCodeAt(0)
-
-	function decode (elt) {
-		var code = elt.charCodeAt(0)
-		if (code === PLUS)
-			return 62 // '+'
-		if (code === SLASH)
-			return 63 // '/'
-		if (code < NUMBER)
-			return -1 //no match
-		if (code < NUMBER + 10)
-			return code - NUMBER + 26 + 26
-		if (code < UPPER + 26)
-			return code - UPPER
-		if (code < LOWER + 26)
-			return code - LOWER + 26
-	}
-
-	function b64ToByteArray (b64) {
-		var i, j, l, tmp, placeHolders, arr
-
-		if (b64.length % 4 > 0) {
-			throw new Error('Invalid string. Length must be a multiple of 4')
-		}
-
-		// the number of equal signs (place holders)
-		// if there are two placeholders, than the two characters before it
-		// represent one byte
-		// if there is only one, then the three characters before it represent 2 bytes
-		// this is just a cheap hack to not do indexOf twice
-		var len = b64.length
-		placeHolders = '=' === b64.charAt(len - 2) ? 2 : '=' === b64.charAt(len - 1) ? 1 : 0
-
-		// base64 is 4/3 + up to two characters of the original data
-		arr = new Arr(b64.length * 3 / 4 - placeHolders)
-
-		// if there are placeholders, only get up to the last complete 4 chars
-		l = placeHolders > 0 ? b64.length - 4 : b64.length
-
-		var L = 0
-
-		function push (v) {
-			arr[L++] = v
-		}
-
-		for (i = 0, j = 0; i < l; i += 4, j += 3) {
-			tmp = (decode(b64.charAt(i)) << 18) | (decode(b64.charAt(i + 1)) << 12) | (decode(b64.charAt(i + 2)) << 6) | decode(b64.charAt(i + 3))
-			push((tmp & 0xFF0000) >> 16)
-			push((tmp & 0xFF00) >> 8)
-			push(tmp & 0xFF)
-		}
-
-		if (placeHolders === 2) {
-			tmp = (decode(b64.charAt(i)) << 2) | (decode(b64.charAt(i + 1)) >> 4)
-			push(tmp & 0xFF)
-		} else if (placeHolders === 1) {
-			tmp = (decode(b64.charAt(i)) << 10) | (decode(b64.charAt(i + 1)) << 4) | (decode(b64.charAt(i + 2)) >> 2)
-			push((tmp >> 8) & 0xFF)
-			push(tmp & 0xFF)
-		}
-
-		return arr
-	}
-
-	function uint8ToBase64 (uint8) {
-		var i,
-			extraBytes = uint8.length % 3, // if we have 1 byte left, pad 2 bytes
-			output = "",
-			temp, length
-
-		function encode (num) {
-			return lookup.charAt(num)
-		}
-
-		function tripletToBase64 (num) {
-			return encode(num >> 18 & 0x3F) + encode(num >> 12 & 0x3F) + encode(num >> 6 & 0x3F) + encode(num & 0x3F)
-		}
-
-		// go through the array every three bytes, we'll deal with trailing stuff later
-		for (i = 0, length = uint8.length - extraBytes; i < length; i += 3) {
-			temp = (uint8[i] << 16) + (uint8[i + 1] << 8) + (uint8[i + 2])
-			output += tripletToBase64(temp)
-		}
-
-		// pad the end with zeros, but make sure to not forget the extra bytes
-		switch (extraBytes) {
-			case 1:
-				temp = uint8[uint8.length - 1]
-				output += encode(temp >> 2)
-				output += encode((temp << 4) & 0x3F)
-				output += '=='
-				break
-			case 2:
-				temp = (uint8[uint8.length - 2] << 8) + (uint8[uint8.length - 1])
-				output += encode(temp >> 10)
-				output += encode((temp >> 4) & 0x3F)
-				output += encode((temp << 2) & 0x3F)
-				output += '='
-				break
-		}
-
-		return output
-	}
-
-	module.exports.toByteArray = b64ToByteArray
-	module.exports.fromByteArray = uint8ToBase64
-}())
-
-},{}],65:[function(require,module,exports){
-exports.read = function(buffer, offset, isLE, mLen, nBytes) {
-  var e, m,
-      eLen = nBytes * 8 - mLen - 1,
-      eMax = (1 << eLen) - 1,
-      eBias = eMax >> 1,
-      nBits = -7,
-      i = isLE ? (nBytes - 1) : 0,
-      d = isLE ? -1 : 1,
-      s = buffer[offset + i];
-
-  i += d;
-
-  e = s & ((1 << (-nBits)) - 1);
-  s >>= (-nBits);
-  nBits += eLen;
-  for (; nBits > 0; e = e * 256 + buffer[offset + i], i += d, nBits -= 8);
-
-  m = e & ((1 << (-nBits)) - 1);
-  e >>= (-nBits);
-  nBits += mLen;
-  for (; nBits > 0; m = m * 256 + buffer[offset + i], i += d, nBits -= 8);
-
-  if (e === 0) {
-    e = 1 - eBias;
-  } else if (e === eMax) {
-    return m ? NaN : ((s ? -1 : 1) * Infinity);
-  } else {
-    m = m + Math.pow(2, mLen);
-    e = e - eBias;
-  }
-  return (s ? -1 : 1) * m * Math.pow(2, e - mLen);
-};
-
-exports.write = function(buffer, value, offset, isLE, mLen, nBytes) {
-  var e, m, c,
-      eLen = nBytes * 8 - mLen - 1,
-      eMax = (1 << eLen) - 1,
-      eBias = eMax >> 1,
-      rt = (mLen === 23 ? Math.pow(2, -24) - Math.pow(2, -77) : 0),
-      i = isLE ? 0 : (nBytes - 1),
-      d = isLE ? 1 : -1,
-      s = value < 0 || (value === 0 && 1 / value < 0) ? 1 : 0;
-
-  value = Math.abs(value);
-
-  if (isNaN(value) || value === Infinity) {
-    m = isNaN(value) ? 1 : 0;
-    e = eMax;
-  } else {
-    e = Math.floor(Math.log(value) / Math.LN2);
-    if (value * (c = Math.pow(2, -e)) < 1) {
-      e--;
-      c *= 2;
-    }
-    if (e + eBias >= 1) {
-      value += rt / c;
-    } else {
-      value += rt * Math.pow(2, 1 - eBias);
-    }
-    if (value * c >= 2) {
-      e++;
-      c /= 2;
-    }
-
-    if (e + eBias >= eMax) {
-      m = 0;
-      e = eMax;
-    } else if (e + eBias >= 1) {
-      m = (value * c - 1) * Math.pow(2, mLen);
-      e = e + eBias;
-    } else {
-      m = value * Math.pow(2, eBias - 1) * Math.pow(2, mLen);
-      e = 0;
-    }
-  }
-
-  for (; mLen >= 8; buffer[offset + i] = m & 0xff, i += d, m /= 256, mLen -= 8);
-
-  e = (e << mLen) | m;
-  eLen += mLen;
-  for (; eLen > 0; buffer[offset + i] = e & 0xff, i += d, e /= 256, eLen -= 8);
-
-  buffer[offset + i - d] |= s * 128;
-};
-
-},{}],66:[function(require,module,exports){
+});
+},{}],57:[function(require,module,exports){
 // shim for using process in browser
 
 var process = module.exports = {};

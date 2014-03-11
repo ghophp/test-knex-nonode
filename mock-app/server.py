@@ -56,7 +56,8 @@ class DbHandler(cyclone.web.RequestHandler):
         if sql is not None:
 
             if bindings is not None:
-                sql = sql.format(bindings)
+                sql = sql.replace('?', '"%s"')
+                sql = sql % tuple(bindings)
 
             print sql
 
