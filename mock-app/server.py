@@ -52,7 +52,7 @@ class DbHandler(cyclone.web.RequestHandler):
         conn = sqlite3.connect('user.sqlite3')
 
         sql = self.get_argument('sql', None)
-        bindings = self.get_argument('bindings[]', None)
+        bindings = self.request.arguments.get("bindings[]", None)
         if sql is not None:
 
             if bindings is not None:
