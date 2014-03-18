@@ -1,11 +1,12 @@
-test-knex-nonode
-================
+# test-knex-nonode
 
-This is project was created to be used with https://github.com/ghophp/knex.
+This project was created to be used along https://github.com/humantech/knex
 
 ## Usage
 
-	npm install
-	grunt
-	cd mock-app/
-	python server.py
+```sh
+$ npm install
+$ grunt
+$ cd mock-app/
+$ python server.py
+```
