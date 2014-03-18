@@ -3,28 +3,55 @@
     <head>
         <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Test Knex</title>
+        <title>Test Knex (with Backbone)</title>
         <link href="static/css/style.min.css" rel="stylesheet">
     </head>
     <body style="padding-top: 60px;">
         
-        <div class="row">
-            <div class="col-md-4 col-md-offset-4">
-                <div class="well">
-                    <a href="javascript:void(0)" class="btn btn-success find-users">Find Users</a>
-                    <div class="row">
-                        <div class="col-md-12 users-wrapper" style="margin-top:15px;">
+        <div class="container">
 
-                        </div>
-                    </div>
-                </div>
-            </div>
+            <div id="main"></div>
+
         </div>
 
+        <!-- Libraries -->
         <script src="static/js/libs/jquery.js"></script>
+        <script src="static/js/libs/underscore.js"></script>
+        <script src="static/js/libs/backbone.js"></script>
+        <script src="static/js/libs/marionette.js"></script>
         <script src="static/js/libs/knex-bundle.js"></script>
         <script src="static/js/libs/inflection.min.js"></script>
         <script src="static/js/libs/bookshelf-bundle.js"></script>
+
+        <!-- Application -->
         <script src="static/js/script.min.js"></script>
+
+        <!-- Templates -->
+        <script id="template-layout" type="text/template">
+            <div class="well container">
+                <form id="form-finduser" class="form-inline" role="form">
+                    <div class="form-group">
+                        <label class="sr-only" for="name">Name</label>
+                        <input type="text" class="form-control" id="name" placeholder="Enter name">
+                    </div>            
+                    <button type="submit" class="btn btn-success">Find</button>
+                </form>
+            </div>
+            <div id="result"></div>
+        </script>
+
+        <script id="template-empty-list" type="text/template">
+            Nenhum resultado encontrado
+        </script>
+
+        <script id="template-users" type="text/template">
+            <h3>Result</h3>
+            <ul></ul>
+        </script>
+
+        <script id="template-user" type="text/template">
+            <%= name %> - <%= age %>
+        </script>
+
     </body>
 </html>

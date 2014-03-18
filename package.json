@@ -1,6 +1,6 @@
 {
   "name": "test-knex",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "No Node Knex",
   "main": "Gruntfile.js",
   "scripts": {
@@ -13,10 +13,12 @@
   "author": "Humantech",
   "license": "COPYRIGHT",
   "devDependencies": {
-    "grunt": "~0.4.1",
+    "matchdep": "^0.3.0",
+    "grunt": "^0.4.4",
     "grunt-contrib-uglify": "~0.2.4",
     "grunt-recess": "~0.4.0",
     "grunt-contrib-watch": "~0.5.3",
-    "grunt-notify": "~0.2.17"
+    "grunt-notify": "~0.2.17",
+    "grunt-contrib-jshint": "^0.9.2"
   }
 }

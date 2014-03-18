@@ -35,11 +35,28 @@ module.exports = function (grunt) {
                 }
             }
         },
+
+        jshint: {
+            options: {
+                jshintrc: true,
+                globals: {
+                    jQuery: true
+                }
+            },
+            all: ['<%= data_path %>js/script.js']
+        },
         
         watch: {
-            data: {
-                files: '<%= data_path %>**/*',
-                tasks: ['build']
+            options: {
+                // livereload: true
+            },
+            js: {
+                files: '<%= data_path %>**/*.js',
+                tasks: ['uglify']
+            },
+            less: {
+                files: '<%= data_path %>**/*.less',
+                tasks: ['recess']
             },
             server: {
                 files: [
@@ -69,11 +86,14 @@ module.exports = function (grunt) {
     require('matchdep').filterDev('grunt-*').forEach(grunt.loadNpmTasks);
         
     /////////////////////////
+    
+    // Test
+    grunt.registerTask('test', ['jshint']);
         
     // Development build
     grunt.registerTask('build', ['recess', 'uglify', 'notify:build']);
 
     // Default deloyment
-    grunt.registerTask('default', ['build']);
+    grunt.registerTask('default', ['test', 'build']);
 
 };

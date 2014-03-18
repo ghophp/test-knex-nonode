@@ -47,9 +47,16 @@ class MainHandler(cyclone.web.RequestHandler):
 
 class DbHandler(cyclone.web.RequestHandler):
 
+    def dict_factory(self, cursor, row):
+        d = {}
+        for idx, col in enumerate(cursor.description):
+            d[col[0]] = row[idx]
+        return d
+
     def post(self):
 
         conn = sqlite3.connect('user.sqlite3')
+        conn.row_factory = self.dict_factory
 
         sql = self.get_argument('sql', None)
         bindings = self.request.arguments.get("bindings[]", None)
@@ -65,8 +72,7 @@ class DbHandler(cyclone.web.RequestHandler):
             c.execute(sql)
             
             result = c.fetchall()
-            print result
-
+          
             self.write(cyclone.web.escape.json_encode(result))
 
 
