@@ -3,7 +3,7 @@ test-knex-nonode
 
 This is project was created to be used with https://github.com/ghophp/knex.
 
-##usage
+## Usage
 
 	npm install
 	grunt
